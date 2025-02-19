@@ -113,6 +113,12 @@ def validate_prefill_and_target_lengths(max_prefill_length: int, max_target_leng
     )
 
 
+def validate_rope_type(rope_type: str) -> None:
+  valid_rope_types = ("default", "yarn", "llama3.1")
+  if rope_type not in valid_rope_types:
+    raise ValueError(f"Invalid RoPE type was passed. Got: {rope_type}. Valid options: {valid_rope_types}")
+
+
 def validate_keys(keys):
   validate_attention_kernel(keys["attention"])
   validate_attention_type(keys["attention_type"])
@@ -122,6 +128,7 @@ def validate_keys(keys):
   validate_kv_quant_axis(keys["kv_quant_axis"], keys["quantize_kvcache"])
   validate_model_call_mode(keys["model_call_mode"])
   validate_prefill_and_target_lengths(keys["max_prefill_predict_length"], keys["max_target_length"])
+  validate_rope_type(keys["rope_type"])
 
   assert (keys["load_parameters_path"] == "" and keys["load_full_state_path"] == "") or keys[
       "enable_checkpointing"
@@ -515,6 +522,7 @@ def create_parallelisms_list(raw_keys):
       raw_keys["ici_fsdp_transpose_parallelism"],
       raw_keys["ici_sequence_parallelism"],
       raw_keys["ici_tensor_parallelism"],
+      raw_keys["ici_tensor_transpose_parallelism"],
       raw_keys["ici_tensor_sequence_parallelism"],
       raw_keys["ici_expert_parallelism"],
       raw_keys["ici_autoregressive_parallelism"],
@@ -526,6 +534,7 @@ def create_parallelisms_list(raw_keys):
       raw_keys["dcn_fsdp_transpose_parallelism"],
       raw_keys["dcn_sequence_parallelism"],
       raw_keys["dcn_tensor_parallelism"],
+      raw_keys["dcn_tensor_transpose_parallelism"],
       raw_keys["dcn_tensor_sequence_parallelism"],
       raw_keys["dcn_expert_parallelism"],
       raw_keys["dcn_autoregressive_parallelism"],
@@ -602,6 +611,7 @@ def set_and_validate_pipeline_config(raw_keys):
           raw_keys["ici_fsdp_transpose_parallelism"],
           raw_keys["ici_sequence_parallelism"],
           raw_keys["ici_tensor_parallelism"],
+          raw_keys["ici_tensor_transpose_parallelism"],
           raw_keys["ici_tensor_sequence_parallelism"],
           raw_keys["ici_expert_parallelism"],
           raw_keys["ici_autoregressive_parallelism"],
@@ -613,6 +623,7 @@ def set_and_validate_pipeline_config(raw_keys):
           raw_keys["dcn_fsdp_transpose_parallelism"],
           raw_keys["dcn_sequence_parallelism"],
           raw_keys["dcn_tensor_parallelism"],
+          raw_keys["dcn_tensor_transpose_parallelism"],
           raw_keys["dcn_tensor_sequence_parallelism"],
           raw_keys["dcn_expert_parallelism"],
           raw_keys["dcn_autoregressive_parallelism"],
@@ -624,12 +635,24 @@ def set_and_validate_pipeline_config(raw_keys):
           "fsdp_transpose",
           "sequence",
           "tensor",
+          "tensor_transpose",
           "tensor_sequence",
           "expert",
           "autoregressive",
       ]
       data_sharding = [
-          ["stage", "data", "fsdp", "fsdp_transpose", "sequence", "tensor", "tensor_sequence", "expert", "autoregressive"]
+          [
+              "stage",
+              "data",
+              "fsdp",
+              "fsdp_transpose",
+              "sequence",
+              "tensor",
+              "tensor_transpose",
+              "tensor_sequence",
+              "expert",
+              "autoregressive",
+          ]
       ]
 
       raw_keys["ici_parallelism"] = ici_parallelism
@@ -693,6 +716,8 @@ def validate_megablox_parallelism(raw_keys):
       * raw_keys["dcn_tensor_parallelism"]
       * raw_keys["ici_tensor_sequence_parallelism"]
       * raw_keys["dcn_tensor_sequence_parallelism"]
+      * raw_keys["ici_tensor_transpose_parallelism"]
+      * raw_keys["dcn_tensor_transpose_parallelism"]
   )
   if raw_keys["megablox"] and using_tensor_parallelism(raw_keys) and (raw_keys["emb_dim"] % tensor_parallelism):
     raise ValueError(

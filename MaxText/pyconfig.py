@@ -207,6 +207,7 @@ def validate_model_name(s: str) -> bool:
       "llama3.1-8b",
       "llama3.1-70b",
       "llama3.1-405b",
+      "llama3.3-70b",
       "mistral-7b",
       "mixtral-8x7b",
       "mixtral-8x22b",
@@ -397,7 +398,8 @@ class _HyperParameters:
 
     if raw_keys["log_config"]:
       for k in keys:
-        max_logging.log(f"Config param {k}: {raw_keys[k]}")
+        if k != "hf_access_token":
+          max_logging.log(f"Config param {k}: {raw_keys[k]}")
 
   @staticmethod
   def user_init(raw_keys):

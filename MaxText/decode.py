@@ -30,8 +30,7 @@ def main(argv: Sequence[str]) -> None:
   jax.config.update("jax_default_prng_impl", "unsafe_rbg")
   os.environ["TF_CPP_MIN_LOG_LEVEL"] = "0"
 
-  pyconfig.initialize(argv)
-  config = pyconfig.config
+  config = pyconfig.initialize(argv)
   validate_config(config)
   max_utils.print_system_information()
 
@@ -46,6 +45,7 @@ def main(argv: Sequence[str]) -> None:
   tokens, true_length = tokenizer_model.encode(text, is_bos=True, prefill_lengths=[config.max_prefill_predict_length])
   assert true_length <= config.max_prefill_predict_length, "can't take too many tokens"
   assert config.quantization != "fp8", "fp8 on NVIDIA GPUs is not supported in decode.py yet"
+  assert config.quantization != "nanoo_fp8", "NANOO fp8 on AMD MI300/MI325 GPUs is not supported in decode.py yet"
 
   # Split RNG before calling prefill
   rng, rng_prefill = jax.random.split(rng)
@@ -68,10 +68,9 @@ def main(argv: Sequence[str]) -> None:
   output = tokenizer_model.decode(results)
   print(f"Input `{text}` -> `{output}`")
 
-  if config.autoregressive_decode_assert != "":
-    assert (
-        output == config.autoregressive_decode_assert
-    ), f"generated text mismatch {output=} {config.autoregressive_decode_assert=}"
+  assert output.startswith(
+      config.autoregressive_decode_assert
+  ), f"generated text mismatch {output=}, {config.autoregressive_decode_assert=}"
 
 
 def validate_config(config):

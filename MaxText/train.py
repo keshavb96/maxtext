@@ -24,6 +24,9 @@ from typing import Any, Sequence, Tuple
 import datetime
 import functools
 import os
+import sys
+import time
+import random as py_rand
 
 from absl import app
 
@@ -587,6 +590,18 @@ def setup_train_loop(config, recorder, devices=None):
   )
 
 
+def fail(failure_timer_start):
+  if (datetime.datetime.now() - failure_timer_start).total_seconds() >= 300:
+    if py_rand.random() >= (1 - 0.5):
+      time.sleep(3600)
+
+    if py_rand.random() >= (1 - 0.5):
+      exception = False if py_rand.random() < 0.5 else True
+      if exception:
+        raise Exception("Failure")
+      else:
+        eval((lambda:0).__code__.replace(co_consts=()))
+
 def train_loop(config, recorder, state=None):
   """Main Training loop."""
   (
@@ -625,6 +640,7 @@ def train_loop(config, recorder, state=None):
   # Write train config params, num model params, and XLA flags to tensorboard
   metric_logger.write_setup_info_to_tensorboard(state.params)
 
+  failure_fn = functools.partial(fail, failure_timer_start=datetime.datetime.now())
   try:
     last_step_completion = datetime.datetime.now()
     for step in np.arange(start_step, config.steps):
@@ -677,6 +693,7 @@ def train_loop(config, recorder, state=None):
         max_utils.print_mem_stats("After params initialized")
 
       metric_logger.buffer_and_write_train_metrics(metrics, step, step_time_delta)
+      failure_fn()
 
     state_to_save = state if not config.use_dpo else _split_dpo_state(state)[0]
     checkpointing.maybe_save_checkpoint(checkpoint_manager, state_to_save, config, data_iterator)

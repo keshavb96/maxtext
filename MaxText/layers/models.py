@@ -1,16 +1,16 @@
-#  Copyright 2023 Google LLC
+# Copyright 2023–2025 Google LLC
 #
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#       https://www.apache.org/licenses/LICENSE-2.0
+#    https://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Transformer models."""
 # pylint: disable=arguments-differ
@@ -41,12 +41,19 @@ from MaxText.maxtext_utils import all_gather_over_fsdp
 class Transformer(nn.Module):
   """An autoregressive transformer model."""
 
-  # Make new attributes required, so that all Transformer dependencies (train, decode, compile, etc) will error instead
-  #   of silently use defaults.
+  # Make new attributes required, so that all Transformer dependencies (train, decode,
+  # compile, etc) will error instead of silently use defaults.
   # pylint: disable=attribute-defined-outside-init
   config: Config
   mesh: Mesh
   quant: Quant
+  # Possible model_mode values can be found in MaxText.common_types.
+  # We generally use MaxText.common_types.MODEL_MODE_TRAIN or
+  # MaxText.common_types.MODEL_MODE_PREFILL for initializations here.
+  # TODO: Make model_mode required after confirming no users are affected.
+  model_mode: str = MODEL_MODE_TRAIN # May be different than the model_mode passed to __call__
+  # pylint: enable=attribute-defined-outside-init
+
 
   def setup(self):
     """Initialize shared_embedding & decoder layers."""
@@ -63,7 +70,9 @@ class Transformer(nn.Module):
         config=cfg,
     )
     self.vision_encoder = VisionEncoder(config=cfg, mesh=mesh) if cfg.use_multimodal else None
-    self.decoder = Decoder(config=cfg, shared_embedding=self.shared_embedding, mesh=mesh, quant=self.quant)
+    self.decoder = Decoder(
+        config=cfg, shared_embedding=self.shared_embedding, mesh=mesh, quant=self.quant, model_mode=self.model_mode
+    )
     # If MTP is enabled via config, set up the MTP block.
     if self.config.mtp_num_layers > 0:
       # Get the list of layer blueprints for the current model.
@@ -136,6 +145,7 @@ class Transformer(nn.Module):
         dummy_shape = decoder_input_tokens.shape
         decoder_target_tokens = jnp.ones(dummy_shape, dtype=jnp.int32)
         decoder_target_mask = jnp.ones(dummy_shape, dtype=jnp.int32)
+        decoder_segment_ids = jnp.ones(dummy_shape, dtype=jnp.int32)
 
     # The Multi-Token Prediction (MTP) block functions as a "side-car" to the main
     # model, active only during training. It computes an auxiliary loss based on
@@ -179,9 +189,14 @@ class ZeroOneTransformer(nn.Module):
   config: Config
   mesh: Mesh
   quant: Quant
+  # Possible model_mode values can be found in MaxText.common_types.
+  # We generally use MaxText.common_types.MODEL_MODE_TRAIN or
+  # MaxText.common_types.MODEL_MODE_PREFILL for initializations here.
+  # TODO: Make model_mode required after confirming no users are affected.
+  model_mode: str = MODEL_MODE_TRAIN # May be different than the model_mode passed to __call__
 
   def setup(self):
-    self.model = Transformer(self.config, self.mesh, self.quant)
+    self.model = Transformer(self.config, self.mesh, self.quant, self.model_mode)
 
   def __call__(
       self,

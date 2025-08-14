@@ -1,16 +1,16 @@
-#  Copyright 2023 Google LLC
+# Copyright 2023–2025 Google LLC
 #
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#       https://www.apache.org/licenses/LICENSE-2.0
+#    https://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Embedding Layers."""
 
@@ -26,6 +26,7 @@ from flax import linen as nn
 from flax import nnx
 
 from MaxText import max_logging
+from MaxText import max_utils
 from MaxText.common_types import MODEL_MODE_PREFILL, MODEL_MODE_TRAIN, Array, Config, DType
 from MaxText.layers import nnx_wrappers
 from MaxText.layers.initializers import Initializer, default_embed_init, variable_to_logically_partitioned
@@ -37,8 +38,7 @@ def _maybe_move_embedding_to_device(embedding_table: Array, config: Config) -> A
   """Moves embedding table to device if parameter offloading is enabled."""
   if config.parameter_memory_host_offload:
     max_logging.log("embeddings.py: Moving embedding parameter to device")
-    # pylint: disable=protected-access
-    return jax.device_put(embedding_table, jax._src.sharding_impls.TransferToMemoryKind("device"))
+    return jax.device_put(embedding_table, max_utils.device_space())
   return embedding_table
 
 

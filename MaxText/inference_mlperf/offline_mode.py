@@ -1,10 +1,10 @@
-# Copyright 2024 Google LLC
+# Copyright 2023–2025 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#    https://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -33,7 +33,7 @@ import pandas as pd
 import jax
 import jax.numpy as jnp
 
-import mlperf_loadgen as lg
+import mlperf_loadgen as lg  # pytype: disable=import-error
 # pylint: disable=no-name-in-module
 
 from MaxText.maxengine import create_engine_from_config_flags
@@ -169,7 +169,7 @@ flags.DEFINE_bool(
 flags.DEFINE_string(
     "rename_dataset_cols",
     "",
-    "Rename some of the dataset columns to whats expected by code. For example, "
+    "Rename some of the dataset columns to what's expected by code. For example, "
     "mixtral dataset uses ref_token_length instead of ref_token_len. Format is a string dict "
     'eg. {"tok_input_len": "tok_input_length"}',
     required=False,

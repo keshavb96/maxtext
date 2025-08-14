@@ -1,16 +1,16 @@
-#  Copyright 2023 Google LLC
+# Copyright 2023–2025 Google LLC
 #
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#       https://www.apache.org/licenses/LICENSE-2.0
+#    https://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Linear Layers."""
 
@@ -29,6 +29,7 @@ from flax import nnx
 import flax.linen as nn
 
 from MaxText import max_logging
+from MaxText import max_utils
 from MaxText.common_types import MODEL_MODE_PREFILL, DecoderBlockType, DType, Array, Config
 from MaxText.layers import nnx_wrappers, quantizations
 from MaxText.layers import normalizations
@@ -51,12 +52,12 @@ def _convert_to_activation_function(fn_or_string: Union[str, Callable[..., Any]]
     )
 
 
-def _normalize_axes(axes: Iterable[int], ndim: int) -> Tuple[int, ...]:
+def normalize_axes(axes: Iterable[int], ndim: int) -> Tuple[int, ...]:
   # A tuple by convention. len(axes_tuple) then also gives the rank efficiently.
   return tuple(ax if ax >= 0 else ndim + ax for ax in axes)
 
 
-def _canonicalize_tuple(x):
+def canonicalize_tuple(x):
   if isinstance(x, Iterable):
     return tuple(x)
   else:
@@ -87,7 +88,7 @@ def _compute_dot_general_nnx(
   matmul_precision = lax.Precision(matmul_precision)
   if quant_dot_general is not None:
     if initializing:
-      return quant_dot_general.lazy_init(inputs, kernel, ((axis, contract_ind), ((), ())), precision=None)
+      quant_dot_general.lazy_init(inputs, kernel, ((axis, contract_ind), ((), ())), precision=None)
     return quant_dot_general(inputs, kernel, ((axis, contract_ind), ((), ())), precision=None, mutable=["aqt"])
   return dot_general(inputs, kernel, ((axis, contract_ind), ((), ())), precision=matmul_precision)
 
@@ -109,7 +110,7 @@ class DenseGeneral(nnx.Module):
       matmul_precision: str = "default",
       parameter_memory_host_offload: bool = False,
       *,  # Following arguments are keyword-only
-      rngs: nnx.Rngs,
+      rngs: nnx.Rngs = None,
   ):
     """Initializes the DenseGeneral module.
 
@@ -128,9 +129,9 @@ class DenseGeneral(nnx.Module):
       parameter_memory_host_offload: Determines whether to offload params to host
       rngs: RNG state for initialization in nnx.
     """
-    self.in_features_shape = _canonicalize_tuple(in_features_shape)
-    self.out_features_shape = _canonicalize_tuple(out_features_shape)
-    self.axis = _canonicalize_tuple(axis)
+    self.in_features_shape = canonicalize_tuple(in_features_shape)
+    self.out_features_shape = canonicalize_tuple(out_features_shape)
+    self.axis = canonicalize_tuple(axis)
     self.weight_dtype = weight_dtype
     self.dtype = dtype
     self.kernel_init = kernel_init
@@ -194,7 +195,7 @@ class DenseGeneral(nnx.Module):
       The transformed input.
     """
     inputs = jnp.asarray(inputs, self.dtype)
-    norm_axis = _normalize_axes(self.axis, inputs.ndim)
+    norm_axis = normalize_axes(self.axis, inputs.ndim)
 
     for i, ax in enumerate(norm_axis):
       if inputs.shape[ax] != self.in_features_shape[i]:
@@ -211,7 +212,7 @@ class DenseGeneral(nnx.Module):
       # Move logit_dense kernel to device if parameter offloading is enabled
       if self.parameter_memory_host_offload:
         max_logging.log("linear.py: Moving parameter logits_dense kernel to device")
-        kernel = jax.device_put(kernel, jax._src.sharding_impls.TransferToMemoryKind("device"))
+        kernel = jax.device_put(kernel, max_utils.device_space())
       kernel = jnp.asarray(kernel, self.dtype)
 
     contract_ind = tuple(range(0, len(self.axis)))
@@ -269,8 +270,8 @@ def dense_general(
     raise ValueError("Exactly one of inputs_shape or in_features must be specified.")
 
   if inputs_shape is not None:
-    axis = _canonicalize_tuple(axis)
-    in_features_shape = tuple(inputs_shape[ax] for ax in _normalize_axes(axis, len(inputs_shape)))
+    axis = canonicalize_tuple(axis)
+    in_features_shape = tuple(inputs_shape[ax] for ax in normalize_axes(axis, len(inputs_shape)))
   else:
     assert in_features_shape is not None
   module = nnx_wrappers.to_linen(
@@ -405,6 +406,9 @@ class MlpBlock(nnx.Module):
         DecoderBlockType.MISTRAL,
         DecoderBlockType.MIXTRAL,
         DecoderBlockType.GEMMA,
+        DecoderBlockType.GEMMA2,
+        DecoderBlockType.GEMMA3,
+        DecoderBlockType.QWEN3,
         DecoderBlockType.DEEPSEEK,
         DecoderBlockType.LLAMA4,
     ):

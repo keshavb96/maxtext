@@ -1,18 +1,16 @@
-"""
-Copyright 2023 Google LLC
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-     https://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+# Copyright 2023–2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 # pylint: disable=g-bad-todo, abstract-method, consider-using-with
 """Training loop and Decoding of the model."""
@@ -310,7 +308,19 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   xent = xent * (data["targets_segmentation"] != 0)
   total_loss = jnp.sum(xent)
   total_weights = jnp.sum(data["targets_segmentation"] != 0)
-  loss = total_loss / (total_weights + EPS)
+
+  # If gradient accumulation is enabled, we don't need to divide total_loss
+  # by total_weights and then multiply the computed gradient by total_weights,
+  # since it's equivalent to computing the gradient from total_loss.
+  # This simplification reduces the number of operations and makes it easier
+  # for XLA to move all-reduce out of the gradient accumulation loop when use
+  # Zero1+GA to reduce communication overhead.
+  # EPS was used to avoid division by zero, but it's not needed when gradient
+  # accumulation is enabled since there's no division.
+  if config.gradient_accumulation_steps > 1:
+    loss = total_loss
+  else:
+    loss = total_loss / (total_weights + EPS)
 
   # Calculate and Add MTP Loss
   mtp_loss = 0.0
@@ -373,7 +383,7 @@ def train_step(model, config, state_mesh_shardings, state, data, dropout_rng):
       acc_grad_and_loss["moe_lb_loss"] += aux["moe_lb_loss"]
       acc_grad_and_loss["mtp_loss"] += aux["mtp_loss"]
       acc_grad_and_loss["grad"] = jax.tree_util.tree_map(
-          lambda x, y: x * aux["total_weights"] + y, cur_batch_gradient, acc_grad_and_loss["grad"]
+          lambda x, y: x + y, cur_batch_gradient, acc_grad_and_loss["grad"]
       )
       acc_grad_and_loss["total_weights"] += aux["total_weights"]
       return acc_grad_and_loss, aux
@@ -526,7 +536,7 @@ def setup_train_loop(config, recorder, devices=None):
 
   with maybe_record_goodput(recorder, GoodputEvent.TRAINING_PREPARATION):
     data_iterator, eval_data_iterator = create_data_iterator(config, mesh)
-    context_parallel_size = mesh.shape["context"]
+    context_parallel_size = config.context_parallel_size
     # Check if context parallelism is being used with sequence packing
     if context_parallel_size > 1 and config.packing and config.dataset_type != "synthetic":
       raise ValueError(
@@ -546,7 +556,8 @@ def setup_train_loop(config, recorder, devices=None):
         model, data_iterator, tx, config, init_rng, mesh, checkpoint_manager
     )
 
-    if not config.using_pipeline_parallelism:
+    # TODO(aireenmei, hengtaoguo): support sharding in vit for multimodal
+    if not config.using_pipeline_parallelism and not config.use_multimodal:
       # The vocab tensor(s) of shape [vocab, embed] (and transpose) are not sharded by stage
       maxtext_utils.assert_params_sufficiently_sharded(state.params, mesh, config.sharding_tolerance)
 
@@ -566,6 +577,9 @@ def setup_train_loop(config, recorder, devices=None):
             step=0,
             use_ocdbt=config.checkpoint_storage_use_ocdbt,
             use_zarr3=config.checkpoint_storage_use_zarr3,
+            enable_orbax_v1=config.enable_orbax_v1,
+            checkpoint_conversion_fn=config.checkpoint_conversion_fn,
+            source_checkpoint_layout=config.source_checkpoint_layout,
         )
       except FileNotFoundError:
         step0_restored = None
@@ -672,6 +686,10 @@ def train_loop(config, recorder, state=None):
 
       if config.eval_interval > 0 and step > start_step and (step + 1) % config.eval_interval == 0:
         assert eval_data_iterator
+
+        # Explicitly reset the eval counters before starting the eval loop
+        metric_logger.reset_eval_metrics()
+
         eval_step_count = 0
         # pylint: disable=not-callable
         for eval_batch in eval_data_iterator:

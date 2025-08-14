@@ -1,10 +1,10 @@
-# Copyright 2023 Google LLC
+# Copyright 2023–2025 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#      https://www.apache.org/licenses/LICENSE-2.0
+#    https://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -62,6 +62,13 @@ checkpoint_storage_use_zarr3: True
 # larger models requires higher concurrent GB for I/O
 # default concurrent gb for PytreeCheckpointHandler is 96GB
 checkpoint_storage_concurrent_gb: 96
+
+# Bool flag for enabling Orbax v1.
+enable_orbax_v1: False
+# Function for processing loaded checkpoint dict into a format MaxText can understand. (for other formats, i.e. SafeTensors)
+checkpoint_conversion_fn: None
+# Optional checkpoint context to use for loading. Options: "orbax", "safetensors"
+source_checkpoint_layout: "orbax"
 ############################### END CHECKPOINTING ##################################
 
 
@@ -83,6 +90,7 @@ dtype: "bfloat16"
 # 'intmp' for mixed precision quantization for inference as described here: MaxText/configs/quantization/README.md
 # 'fp8' for 8-bit floating-point GeMMs on NVIDIA GPUs.
 # 'nanoo_fp8' for 8-bit floating-point GeMMs on AMD MI300/MI325 GPUs.
+# 'fp8_full' for FP8 quantization with static scaling.
 quantization: ""
 # Used to configure constant_bound_config in aqt lib for static scaling, e.g. constant_bound_config='0.5, 0.5, 0.5, 0.5, 0.5, 0.5'
 constant_bound_config: ""
@@ -110,7 +118,9 @@ save_quantized_params_path: ""
 # when left as is, corresponds to training
 # accepted values are "inference"
 model_call_mode: ""
-
+use_qwix_quantization: False # Whether to use qwix for quantization. If set to True, the model will be quantized using qwix.
+# Quantization calibration method used for weights and activations. Supported methods can be found in https://github.com/google/qwix/blob/dc2a0770351c740e5ab3cce7c0efe9f7beacce9e/qwix/qconfig.py#L70-L80
+quantization_calibration_method: "absmax"
 # Shard the range finding operation for quantization. By default this is set to number of slices.
 quantization_local_shard_count: -1
 
@@ -129,7 +139,7 @@ head_dim: 128
 mlp_activations: ["silu", "linear"]
 dropout_rate: 0.0
 logits_via_embedding: False
-normalize_embedding_logits: True  # whether to normlize pre-softmax logits if logits_via_embedding is true
+normalize_embedding_logits: True  # whether to normalize pre-softmax logits if logits_via_embedding is true
 logits_dot_in_fp32: False  # whether to use fp32 in logits_dense or shared_embedding dot product for stability
 cast_logits_to_fp32: True # whether to cast the logits to fp32. The higher precision is generally beneficial, but it can vary slightly.
 float32_qk_product: False # in dot_product attention, whether to cast to fp32 the inputs to qk product
@@ -159,6 +169,12 @@ use_random_routing: False # whether to use random routing for debug/test purpose
 tile_batch_seq: 512
 tile_activation_dim: 1024
 tile_weight_dim: 1024
+norm_topk_prob: False # Boolean to enable the top-k probability normalization. Qwen3-specific normalization of router weights.
+
+# How the expert axis is used to shard attention weights and activations
+# "fsdp" (ep acts as fsdp parallelism)
+# "context" (ep acts as context parallelism, training only)
+expert_shard_attention_option: "fsdp"
 
 # deepseek moe
 base_moe_mlp_dim: 7168 # intermediate dimension at MoE layer (use base_mlp_dim if not DeepSeek style)
@@ -174,7 +190,7 @@ topk_routing_group: -1 # number of top groups to route inputs. For EP,
 # For complex architectures like llama4 there are repeated sets of
 # inhomogeneous layers. E.g. maverick uses [dense+rope, moe+rope, dense+rope, moe+nope]
 # which can only be scanned together in one large block of inhomogeneous_layer_cycle_interval=4 layers.
-inhomogeneous_layer_cycle_interval: 1 
+inhomogeneous_layer_cycle_interval: 1
 
 # pipeline parallelism
 # The number of decoder layers is equal to the product of num_stages, num_layers_per_pipeline_stage and num_pipeline_repeats.
@@ -308,18 +324,22 @@ logical_axis_rules: [
                       ['activation_embed_and_logits_batch', ['data', 'stage', 'fsdp', 'fsdp_transpose', 'expert']],
                       ['activation_heads', ['tensor', 'tensor_transpose', 'sequence','tensor_sequence','autoregressive']],
                       ['activation_kv_heads', ['tensor', 'tensor_transpose', 'sequence','tensor_sequence']],
-                      ['activation_length', ['sequence', 'context']],
-                      ['prefill_activation_length', ['sequence', 'context']],
-                      ['activation_length', ['context']],
+                      ['activation_length', ['sequence', 'context', 'expert']],
+                      ['activation_length', ['context', 'expert']],
+                      ['activation_length_no_exp', ['sequence', 'context']],
+                      ['activation_length_no_exp', ['context']],
                       ['activation_norm_length', ['tensor_sequence', 'context', 'sequence']],
+                      ['activation_q_length', ['context', 'expert']],
+                      ['activation_q_length_no_exp', ['context']],
+                      ['prefill_activation_length', ['sequence', 'context']],
                       ['prefill_activation_norm_length', ['tensor_sequence', 'context', 'sequence']],
-                      ['activation_q_length', ['context']],
                       ['activation_kv_length', []],
                       ['activation_embed', ['tensor', 'tensor_transpose']],
                       ['activation_mlp', ['tensor', 'tensor_transpose', 'tensor_sequence']],
                       ['activation_kv', ['tensor', 'tensor_transpose', 'tensor_sequence']],
                       ['activation_prefill_kv_batch', ['data', 'fsdp', 'fsdp_transpose', 'expert']],
                       ['activation_kv_batch', ['data', 'fsdp', 'fsdp_transpose', 'expert']],
+                      ['activation_kv_batch_no_exp', ['data', 'fsdp', 'fsdp_transpose']],
                       ['activation_kv_head_dim', ['tensor', 'tensor_transpose', 'tensor_sequence']],
                       ['activation_vocab', ['tensor', 'tensor_transpose', 'sequence', 'tensor_sequence']],
                       ['activation_vocab', ['tensor', 'tensor_transpose']],
@@ -342,6 +362,7 @@ logical_axis_rules: [
                       ['embed_no_exp', ['fsdp', 'sequence', 'tensor_transpose', 'context']],
                       ['embed_no_exp', ['fsdp', 'fsdp_transpose', 'sequence', 'context']],
                       ['embed_no_exp', ['fsdp', 'sequence', 'context']],
+                      ['embed_tensor_transpose', ['tensor_transpose']],           
                       ['q_lora', ['fsdp', 'fsdp_transpose', 'sequence', 'context', 'tensor_transpose', 'expert']],
                       ['q_lora', ['fsdp', 'sequence', 'context', 'tensor_transpose', 'expert']],
                       ['q_lora', ['fsdp', 'fsdp_transpose', 'sequence', 'context', 'expert']],
@@ -729,7 +750,7 @@ enable_prefix_caching: False
 prefix_caching_hbm_byte: 10_000_000_000 # 10 GB
 prefix_caching_dram_byte: 100_000_000_000 # 100 GB
 
-# This is a temporary flag that will removed soon after the fix lands in TE
+# This is a temporary flag that will be removed soon after the fix lands in TE
 enable_padding_causal_mask: True
 
 # Llama4-specific
@@ -756,7 +777,7 @@ image_path: "" # Local image path used for decoding
 image_placeholder: "<|image|>"
 
 ### llama4 multi modal configs
-hidden_size_for_vit: 1408 
+hidden_size_for_vit: 1408
 intermediate_size_for_vit: 5632
 num_attention_heads_for_vit: 16
 num_channels_for_vit: 3

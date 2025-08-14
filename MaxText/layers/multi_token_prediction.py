@@ -1,18 +1,16 @@
-"""
-Copyright 2025 Google LLC
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-     https://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+# Copyright 2023–2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """JAX implementation of the Multi Token Predicition https://arxiv.org/pdf/2412.19437 """
 
@@ -25,7 +23,7 @@ from jax.sharding import Mesh
 from flax import linen as nn
 
 from MaxText.common_types import Config, MODEL_MODE_TRAIN
-from MaxText.layers.attentions import dense_general
+from MaxText.layers.linears import dense_general
 from MaxText.layers.normalizations import rms_norm
 from MaxText.layers.decoders import Decoder, DecoderLayer
 from MaxText import max_utils
@@ -137,7 +135,7 @@ class MultiTokenPredictionLayer(nn.Module):
 
     # --- 2. Concatenate Normalized Representations ---
     # Shape: [B, S, 2*H]
-    concatenated_features = jnp.concatenate([hidden_state_norm, embedding_norm], axis=-1)
+    concatenated_features = jnp.concatenate([embedding_norm, hidden_state_norm], axis=-1)
 
     # --- 3. Project Concatenated Features ---
     # Projects from 2*H back down to H
@@ -146,6 +144,7 @@ class MultiTokenPredictionLayer(nn.Module):
         out_features_shape=cfg.base_emb_dim,
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
+        use_bias=False,
         kernel_axes=("concat_embed", "embed"),
         name=f"mtp_{k}_projection",
     )
@@ -153,7 +152,7 @@ class MultiTokenPredictionLayer(nn.Module):
     projected_features = projection_layer(concatenated_features)
 
     # --- 4. Pass through MTP Transformer Block ---
-    output = self.transformer_layer_module(config=cfg, mesh=mesh, name=f"mtp_{k}_transformer_layer")(
+    output = self.transformer_layer_module(config=cfg, mesh=mesh, model_mode=model_mode, name=f"mtp_{k}_transformer_layer")(
         inputs=projected_features,
         decoder_segment_ids=decoder_segment_ids,
         decoder_positions=position_ids,
@@ -225,7 +224,7 @@ class MultiTokenPredictionBlock(nn.Module):
       )
 
       next_mtp_hidden_state = mtp_layer(
-          mtp_hidden_state, target_token_embedding, rolled_position_id, decoder_segment_ids, deterministic, model_mode
+          mtp_hidden_state, target_token_embedding, position_ids, decoder_segment_ids, deterministic, model_mode
       )
 
       # Project to logits using the shared embedding transpose

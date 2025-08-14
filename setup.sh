@@ -1,12 +1,12 @@
 #!/bin/bash
 
-# Copyright 2023 Google LLC
+# Copyright 2023–2025 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#      https://www.apache.org/licenses/LICENSE-2.0
+#    https://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -42,8 +42,7 @@ apt update -y && apt -y install gcsfuse
 rm -rf /var/lib/apt/lists/*
 EOF
 
-# We need to pin specific versions of setuptools, see b/402501203 for more.
-python3 -m pip install setuptools==65.5.0 wheel==0.45.1
+python3 -m pip install -U setuptools wheel
 
 # Set environment variables
 for ARGUMENT in "$@"; do
@@ -155,7 +154,11 @@ elif [[ "$MODE" == "stable" || ! -v MODE ]]; then
             python3 -m pip install "jax[cuda12]"
         fi
         export NVTE_FRAMEWORK=jax
-        python3 -m pip install git+https://github.com/NVIDIA/TransformerEngine.git@stable
+        if [[ -n "$JAX_VERSION" && "$JAX_VERSION" != "0.7.0" ]]; then
+            python3 -m pip install transformer-engine[jax]
+        else
+            python3 -m pip install git+https://github.com/NVIDIA/TransformerEngine.git@9d031f
+        fi
     fi
 elif [[ $MODE == "nightly" ]]; then
 # Nightly mode
@@ -170,7 +173,7 @@ elif [[ $MODE == "nightly" ]]; then
         fi
         # Install Transformer Engine
         export NVTE_FRAMEWORK=jax
-        python3 -m pip install git+https://github.com/NVIDIA/TransformerEngine.git@stable
+        python3 -m pip install https://github.com/NVIDIA/TransformerEngine/archive/9d031f.zip
     elif [[ $DEVICE == "tpu" ]]; then
         echo "Installing jax-nightly, jaxlib-nightly"
         # Install jax-nightly

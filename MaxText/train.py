@@ -606,9 +606,9 @@ def setup_train_loop(config, recorder, devices=None):
   )
 
 
-def fail(failure_timer_start):
+def fail(failure_timer_start, hang_probability):
   if (datetime.datetime.now() - failure_timer_start).total_seconds() >= 300:
-    if py_rand.random() >= (1 - 0.5):
+    if py_rand.random() >= (1 - hang_probability):
       time.sleep(3600)
 
     if py_rand.random() >= (1 - 0.5):
@@ -656,7 +656,7 @@ def train_loop(config, recorder, state=None):
   # Write train config params, num model params, and XLA flags to tensorboard
   metric_logger.write_setup_info_to_tensorboard(state.params)
 
-  failure_fn = functools.partial(fail, failure_timer_start=datetime.datetime.now())
+  failure_fn = functools.partial(fail, failure_timer_start=datetime.datetime.now(), hang_probability=config.hang_probability)
   try:
     last_step_completion = datetime.datetime.now()
     for step in np.arange(start_step, config.steps):

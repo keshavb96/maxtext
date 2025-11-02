@@ -17,7 +17,7 @@ WORKDIR /deps
 
 # Copy setup files and dependency files separately for better caching
 COPY setup.sh ./
-COPY requirements.txt requirements_with_jax_ai_image.txt requirements_with_jax_stable_stack_0_6_1_pipreqs.txt ./
+COPY requirements.txt requirements_with_jax_ai_image.txt requirements_with_jax_stable_stack_0_6_1_pipreqs.txt src/install_maxtext_extra_deps/extra_deps_from_github.txt generated_requirements ./
 
 
 # For JAX AI tpu training images 0.4.37 AND 0.4.35
@@ -47,6 +47,11 @@ RUN if [ "$DEVICE" = "tpu" ] && [ "$JAX_STABLE_STACK_BASEIMAGE" = "us-docker.pkg
         python3 -m pip install -r /deps/requirements_with_jax_ai_image.txt; \
   fi
 
+# Install google-tunix for TPU devices, skip for GPU
+RUN if [ "$DEVICE" = "tpu" ]; then \
+        python3 -m pip install 'google-tunix>=0.1.2'; \
+  fi
+
 # Now copy the remaining code (source files that may change frequently)
 COPY . .
 
@@ -61,7 +66,7 @@ RUN if [ "$TEST_TYPE" = "xlml" ] || [ "$TEST_TYPE" = "unit_test" ]; then \
     fi
 
 # Run the script available in JAX AI base image to generate the manifest file
-RUN bash /jax-stable-stack/generate_manifest.sh PREFIX=maxtext COMMIT_HASH=$COMMIT_HASH
+RUN bash /jax-ai-image/generate_manifest.sh PREFIX=maxtext COMMIT_HASH=$COMMIT_HASH
 
 # Install (editable) MaxText
 RUN test -f '/tmp/venv_created' && "$(tail -n1 /tmp/venv_created)"/bin/activate ; pip install --no-dependencies -e .

@@ -21,11 +21,11 @@ from typing import overload
 from flax import nnx
 import flax.linen as nn
 import jax
-from jax.sharding import Mesh
+from jax.sharding import Mesh, AxisType
 from MaxText import maxtext_utils
 from MaxText import pyconfig
 from MaxText.layers import quantizations
-from MaxText.common_types import MODEL_MODE_TRAIN
+from MaxText.common_types import MODEL_MODE_TRAIN, ShardMode
 from MaxText.layers import models
 from orbax import checkpoint as ocp
 from functools import partial
@@ -38,7 +38,10 @@ def from_config(
     devices: Sequence[jax.Device] | None = None,
     *,
     model_mode: str = MODEL_MODE_TRAIN,
-) -> nn.Module: ...
+) -> nn.Module:
+  ...
+
+
 @overload
 def from_config(
     config: pyconfig.HyperParameters,
@@ -46,7 +49,10 @@ def from_config(
     *,
     model_mode: str = MODEL_MODE_TRAIN,
     rngs: nnx.Rngs,
-) -> models.Transformer: ...
+) -> models.Transformer:
+  ...
+
+
 def from_config(
     config: pyconfig.HyperParameters,
     devices: Sequence[jax.Device] | None = None,
@@ -70,11 +76,18 @@ def from_config(
       model = from_config(config)
   """
   devices_array = maxtext_utils.create_device_mesh(config, devices)
-  mesh = Mesh(devices_array, config.mesh_axes)
+
+  if config.shard_mode == ShardMode.EXPLICIT:
+    axis_types = tuple([AxisType.Explicit] * len(config.mesh_axes))
+  else:
+    axis_types = tuple([AxisType.Auto] * len(config.mesh_axes))
+
+  mesh = Mesh(devices_array, config.mesh_axes, axis_types=axis_types)
   model = create_model(config, mesh, model_mode=model_mode, rngs=rngs)
 
   # Return only the model
   return model
+
 
 def get_transformer_model(config, mesh, quant, model_mode: str = MODEL_MODE_TRAIN, rngs: nnx.Rngs | None = None):
   """Returns the transformer model based on the configuration."""
@@ -99,14 +112,14 @@ def create_model(config, mesh, model_mode: str = MODEL_MODE_TRAIN, rngs: nnx.Rng
   return model
 
 
-def create_nnx_model(config):
+def create_nnx_model(config, devices=None):
   """Creates a NNX model with sharded parameters, possibly loading from a checkpoint."""
 
-  def create_model():
+  def _create_model():
     init_rng = jax.random.PRNGKey(config.init_weights_seed)
-    return from_config(config, rngs=nnx.Rngs(params=init_rng, dropout=1))
+    return from_config(config, devices, rngs=nnx.Rngs(params=init_rng, dropout=1))
 
-  abstract_model = nnx.eval_shape(create_model)
+  abstract_model = nnx.eval_shape(_create_model)
   graphdef, abstract_state = nnx.split(abstract_model)
   specs = nnx.get_partition_spec(abstract_state)
   mesh = abstract_model.mesh
@@ -121,7 +134,7 @@ def create_nnx_model(config):
   def create_sharded_state():
     # This will be JIT-compiled. JAX knows the output sharding and can
     # initialize the parameters directly on the target devices in a sharded way.
-    model = create_model()
+    model = _create_model()
     return nnx.state(model)
 
   with mesh:
@@ -130,38 +143,69 @@ def create_nnx_model(config):
     model = nnx.merge(graphdef, sharded_state)
 
     if config.load_parameters_path:
-      target_for_restore = jax.tree.map(
-          lambda v: v.value,
-          sharded_state,
-          is_leaf=lambda n: isinstance(n, nnx.Variable),
-      )
-
       try:
         ckptr = ocp.Checkpointer(
             ocp.PyTreeCheckpointHandler(
-                restore_concurrent_gb=None,
-                save_concurrent_gb=None,
-                use_ocdbt=True,
-                use_zarr3=True,
+                restore_concurrent_gb=config.checkpoint_storage_concurrent_gb,
+                save_concurrent_gb=config.checkpoint_storage_concurrent_gb,
+                use_ocdbt=config.checkpoint_storage_use_ocdbt,
+                use_zarr3=config.checkpoint_storage_use_zarr3,
             )
         )
+
         # This is a memory optimization. We don't want to restore the entire checkpoint - only the params.
         # Rather than passing the entire abstract state, which could unnecessarily restore opt_state and
         # waste memory, we instead restore the params field of the checkpoint (which itself may be a dictionary
         #  containing a key named 'params').
-        restore_args = ocp.checkpoint_utils.construct_restore_args(target_for_restore)
+
+        # Get the structure of checkpoint in `config.load_parameters_path`
+        metadata = ckptr.metadata(config.load_parameters_path)
+
+        is_nnx_checkpoint = True
+        if (
+            "params" in metadata.item_metadata.tree.keys()
+            and "params" in metadata.item_metadata.tree.get("params", {}).keys()
+        ):
+          # structure of linen checkpoint: {'params': {'params': {'decoder': ...}}}
+          is_nnx_checkpoint = False
+          target_for_restore = jax.tree.map(
+              lambda v: v.value,
+              sharded_state,
+              is_leaf=lambda n: hasattr(n, "value"),
+          )
+
+          item_to_restore = {"params": {"params": target_for_restore}}
+          restore_args = {"params": {"params": ocp.checkpoint_utils.construct_restore_args(target_for_restore)}}
+        else:
+          # structure of nnx checkpoint: {'decoder': {'value': ...}}
+          target_for_restore = jax.tree.map(
+              lambda v: {"value": v.value},
+              sharded_state,
+              is_leaf=lambda n: isinstance(n, nnx.Variable),
+          )
+          item_to_restore = target_for_restore
+          restore_args = ocp.checkpoint_utils.construct_restore_args(target_for_restore)
+
         restored = ckptr.restore(
             epath.Path(config.load_parameters_path),
-            item={"params": {"params": target_for_restore}},
+            item=item_to_restore,
             transforms={},
-            restore_args={"params": {"params": restore_args}},
+            restore_args=restore_args,
         )
-        checkpoint = restored["params"]["params"]
+
+        if is_nnx_checkpoint:
+          checkpoint = jax.tree.map(
+              lambda v: v["value"],
+              restored,
+              is_leaf=lambda x: isinstance(x, dict) and "value" in x and not isinstance(x.get("value"), dict),
+          )
+        else:
+          checkpoint = restored["params"]["params"]
 
         if checkpoint:
           nnx.update(model, checkpoint)
 
       except Exception as e:
-        raise ValueError(f"Checkpoint loading failed: {e}")
+        raise ValueError(f"Checkpoint loading failed: {e}") from e
 
     return model, mesh

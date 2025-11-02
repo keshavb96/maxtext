@@ -26,7 +26,7 @@ from absl.testing import parameterized
 
 import numpy as np
 
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from jax.sharding import Mesh, NamedSharding, AxisType
 import jax
 import jax.numpy as jnp
 
@@ -36,7 +36,14 @@ from flax.linen import partitioning as nn_partitioning
 from MaxText import maxtext_utils
 from MaxText import max_utils
 from MaxText import pyconfig
-from MaxText.common_types import DECODING_ACTIVE_SEQUENCE_INDICATOR, MODEL_MODE_AUTOREGRESSIVE, MODEL_MODE_PREFILL, MODEL_MODE_TRAIN, AttentionType
+from MaxText.common_types import (
+    DECODING_ACTIVE_SEQUENCE_INDICATOR,
+    MODEL_MODE_AUTOREGRESSIVE,
+    MODEL_MODE_PREFILL,
+    MODEL_MODE_TRAIN,
+    AttentionType,
+    ShardMode,
+)
 from MaxText.globals import MAXTEXT_PKG_DIR
 from MaxText.layers.attentions import Attention
 from MaxText.layers.attention_op import ChunkedCausalMask, _make_bidirectional_block_mask, _generate_chunk_attention_mask
@@ -285,6 +292,7 @@ class AttentionTest(parameterized.TestCase):
   def setUp(self):
     """Initializes the configuration for each test"""
     super().setUp()
+    jax.config.update("jax_remove_size_one_mesh_axis_from_type", True)
     config = pyconfig.initialize(
         [sys.argv[0], os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
         **self.config_arguments,
@@ -575,9 +583,14 @@ class AttentionTest(parameterized.TestCase):
           "expert_shard_attention_option": "context",
       },
   )
+  # TODO (b/454764135.) : This tests fails with new tokamax kernel
   @pytest.mark.tpu_only
   def test_tpu_flash_attention_context_parallel(
-      self, ici_context_parallelism, context_parallel_load_balance, ici_expert_parallelism, expert_shard_attention_option
+      self,
+      ici_context_parallelism,
+      context_parallel_load_balance,
+      ici_expert_parallelism,
+      expert_shard_attention_option,
   ):
     """Test equivalence between dot_product and flash attention + context/expert parallelism"""
     num_kv_heads = self.num_kv_heads
@@ -603,7 +616,8 @@ class AttentionTest(parameterized.TestCase):
         expert_shard_attention_option=expert_shard_attention_option,
     )
     devices_array_cp = maxtext_utils.create_device_mesh(cfg_cp)
-    mesh_cp = Mesh(devices_array_cp, cfg_cp.mesh_axes)
+    axis_names = [AxisType.Auto for _ in cfg_cp.mesh_axes]
+    mesh_cp = Mesh(devices_array_cp, cfg_cp.mesh_axes, axis_types=tuple(axis_names))
     attention_as_mha_flash_cp = Attention(
         config=cfg_cp,
         num_query_heads=cfg_cp.num_query_heads,
@@ -625,6 +639,10 @@ class AttentionTest(parameterized.TestCase):
     mha_generic_flash_cp_output = _forward_with_context_expert_parallelism(
         cfg_cp, mesh_cp, attention_as_mha_flash_cp, lnx, decoder_segment_ids, decoder_positions
     )
+
+    # This removes all sharding information and makes them standard NumPy arrays.
+    mha_generic_output = jax.device_get(mha_generic_output)
+    mha_generic_flash_cp_output = jax.device_get(mha_generic_flash_cp_output)
 
     self.assertTrue(
         jax.numpy.allclose(mha_generic_output, mha_generic_flash_cp_output, rtol=1e-01, atol=1e-01, equal_nan=False),
@@ -732,7 +750,9 @@ class AttentionTest(parameterized.TestCase):
       attention_w_layout_full_this_idx = attention_w_layout_full[:, idx : idx + 1, :]
       self.assertTrue(attention_w_layout_full_this_idx.shape == attention_w_layout_idx.shape)
       self.assertTrue(
-          jax.numpy.allclose(attention_w_layout_full_this_idx, attention_w_layout_idx, rtol=rtol, atol=atol, equal_nan=False)
+          jax.numpy.allclose(
+              attention_w_layout_full_this_idx, attention_w_layout_idx, rtol=rtol, atol=atol, equal_nan=False
+          )
       )
 
   @pytest.mark.tpu_only
@@ -849,7 +869,9 @@ class AttentionTest(parameterized.TestCase):
         model_mode=MODEL_MODE_PREFILL,
     )
     self.assertTrue(
-        jax.numpy.allclose(attention_w_reshape_q_full[:, :prefill_length, :], attention_w_reshape_q_prefill, equal_nan=False)
+        jax.numpy.allclose(
+            attention_w_reshape_q_full[:, :prefill_length, :], attention_w_reshape_q_prefill, equal_nan=False
+        )
     )
 
     self.assertTrue(jax.numpy.allclose(attention_wo_reshape_q_prefill, attention_w_reshape_q_prefill, equal_nan=False))
@@ -1044,6 +1066,7 @@ class MLATest(parameterized.TestCase):
   def setUp(self):
     """Initializes the configuration for each test"""
     super().setUp()
+    jax.config.update("jax_remove_size_one_mesh_axis_from_type", True)
     config = pyconfig.initialize(
         [sys.argv[0], os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
         **self.config_arguments,
@@ -1222,7 +1245,7 @@ class MLATest(parameterized.TestCase):
     self.assertTrue(hasattr(base_attention, "out"), "Base Attention should have 'out' projection.")
 
     # 3. Initialize the MLA layer
-    mla_cfg, mla_layer = self.init_mla(self.config_arguments, rope_type="default")
+    _, mla_layer = self.init_mla(self.config_arguments, rope_type="default")
 
     # 4. Assert that the MLA layer DOES NOT HAVE the base projections
     self.assertFalse(hasattr(mla_layer, "query"), "MLA should not have 'query' projection.")
@@ -1282,9 +1305,14 @@ class MLATest(parameterized.TestCase):
           "expert_shard_attention_option": "context",
       },
   )
+  # TODO (b/454764135.) : This tests fails with new tokamax kernel
   @pytest.mark.tpu_only
   def test_tpu_flash_attention_context_parallel(
-      self, ici_context_parallelism, context_parallel_load_balance, ici_expert_parallelism, expert_shard_attention_option
+      self,
+      ici_context_parallelism,
+      context_parallel_load_balance,
+      ici_expert_parallelism,
+      expert_shard_attention_option,
   ):
     """Test equivalence between dot_product and flash attention + context/expert parallelism"""
 
@@ -1377,19 +1405,17 @@ def _forward_with_context_expert_parallelism(cfg_cp, mesh_cp, attention_cp, lnx,
   if context_parallel_size > 1 and cfg_cp.context_parallel_load_balance:
     batch = {"inputs": lnx, "inputs_segmentation": decoder_segment_ids, "inputs_position": decoder_positions}
     with mesh_cp:
-      reordered_batch = max_utils.get_reorder_callable(context_parallel_size)(batch)
+      reordered_batch = maxtext_utils.get_reorder_callable(context_parallel_size, ShardMode.AUTO)(batch)
     lnx = reordered_batch["inputs"]
     decoder_segment_ids = reordered_batch["inputs_segmentation"]
     decoder_positions = reordered_batch["inputs_position"]
   # apply attention with sharding
   with mesh_cp, nn_partitioning.axis_rules(cfg_cp.logical_axis_rules):
     lnx_spec = nn_partitioning.logical_to_mesh_axes(
-        ('activation_batch_no_exp', 'activation_length_no_exp', 'activation_embed'),
-          nn_partitioning.get_axis_rules()
+        ("activation_batch_no_exp", "activation_length_no_exp", "activation_embed"), nn_partitioning.get_axis_rules()
     )
     pos_spec = nn_partitioning.logical_to_mesh_axes(
-        ('activation_batch_no_exp', 'activation_length_no_exp'),
-        nn_partitioning.get_axis_rules()
+        ("activation_batch_no_exp", "activation_length_no_exp"), nn_partitioning.get_axis_rules()
     )
     lnx_sharding = NamedSharding(mesh_cp, lnx_spec)
     pos_sharding = NamedSharding(mesh_cp, pos_spec)

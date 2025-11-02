@@ -11,33 +11,39 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-
+#  pytype: disable=module-attr
 """Attentions Ops Layers."""
-
+import dataclasses
 import functools
 from typing import Any, Callable, Optional, Tuple
 from functools import partial
 import math
 
 import numpy as np
-from packaging import version
 
+import jax
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 from jax.experimental.pallas.ops.gpu import attention as gpu_pallas_attention
 from jax.experimental.pallas.ops.gpu import decode_attention as gpu_pallas_decode_attention
+from jax.experimental import pallas as pl
+from jax.sharding import Mesh, NamedSharding
+import jax.numpy as jnp
+
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
-from jax.experimental.shard_map import shard_map
-from jax.sharding import Mesh
-import jax
-import jax.numpy as jnp
+
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as tokamax_splash_kernel
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as tokamax_splash_mask
+
 
 from flax import linen as nn
 from flax import nnx
 from flax.linen import partitioning
 
+
 from MaxText import max_utils
+from MaxText.sharding import maybe_shard_with_name
 from MaxText.common_types import (
     DEFAULT_MASK_VALUE,
     BATCH,
@@ -467,6 +473,7 @@ class AttentionOp(nnx.Module):
     self.chunk_attn_window_size = chunk_attn_window_size
     self.use_ragged_attention = use_ragged_attention
     self.ragged_block_size = ragged_block_size
+    self.rngs = rngs
 
     def maybe_create_nnx(einsum, *args):
       if isinstance(einsum, nn.Module):
@@ -527,7 +534,9 @@ class AttentionOp(nnx.Module):
     """Check attention inputs."""
 
     assert key.ndim == value.ndim, f"k (dim {key.ndim}), v (dim {value.ndim}) must have same rank."
-    assert query.shape[:-3] == key.shape[:-3] == value.shape[:-3], "q, k, v batch dims must match."
+    assert (
+        query.shape[:-3] == key.shape[:-3] == value.shape[:-3]
+    ), f"{query.shape[:-3]=}, {key.shape[:-3]=}, {value.shape[:-3]=} batch dims must match."
     assert key.shape[-2] == value.shape[-2], "k, v num_kv_heads must match."
     assert key.shape[-3] == value.shape[-3], "k, v lengths must match."
     assert query.shape[-1] == key.shape[-1], "q, k depths must match."
@@ -673,6 +682,138 @@ class AttentionOp(nnx.Module):
 
     return jnp.where(output_mask, 0.0, DEFAULT_MASK_VALUE) if output_mask is not None else None
 
+  def calculate_moba_gate_logic(self, q_item, k_item, q_pos_item):
+    """Computes the block-level MoBA gating intermediates for one batch item.
+
+    Args:
+      q_item: Query tensor shaped `[q_len, n_q_heads, head_dim]`.
+      k_item: Key tensor shaped `[kv_len, n_kv_heads, head_dim]`.
+      q_pos_item: Absolute query positions shaped `[q_len]`, used to derive the
+        chunk index for each query.
+        For example, during prefill after 128 tokens
+        have been processed `q_pos_item` is `jnp.arange(128, 128 + q_len)`,
+        while in autoregressive decode with a single query token it is
+        `jnp.array([kv_len - 1])`.
+
+    Returns:
+      `need_attend`, a boolean mask of shape `[n_kv_heads, g, q_len, num_block]`
+      indicating which key blocks each query should attend to. The additional
+      values in the returned tuple are debug intermediates used for logging and
+      diagnostics when inspecting the gating behaviour.
+    """
+    q_len, n_q_heads, head_dim = q_item.shape
+    kv_len, n_kv_heads, _ = k_item.shape
+    g = n_q_heads // n_kv_heads
+
+    q_item_f32 = q_item.astype(jnp.float32).reshape(q_len, n_kv_heads, g, head_dim)  # grouped-query attention (GQA)
+
+    moba_chunk_size = self.config.moba_chunk_size
+    moba_topk = self.config.moba_topk
+
+    num_block = math.ceil(kv_len / moba_chunk_size)
+
+    block_ids = jnp.arange(kv_len, dtype=jnp.int32) // moba_chunk_size  # chunk index for each key position
+    # Sum key vectors per chunk so we can later average within each block.
+    key_gate_weight_sum = jax.ops.segment_sum(
+        k_item.astype(jnp.float32), block_ids, num_segments=num_block
+    )  # [num_block, n_kv_heads, head_dim]
+    # Count how many tokens end up in each chunk so we can take the mean.
+    block_counts = jax.ops.segment_sum(
+        jnp.ones((kv_len,), dtype=jnp.float32), block_ids, num_segments=num_block
+    )  # [num_block]
+    # Mean Pooling, Avoid division by zero for empty blocks.
+    key_gate_weight = key_gate_weight_sum / jnp.maximum(
+        block_counts[:, None, None], 1
+    )  # [num_block, n_kv_heads, head_dim]
+
+    # Take the dot product between each query and every key chunk to get a score.
+    gate = jnp.einsum("skgd,Nkd->kgsN", q_item_f32, key_gate_weight)  # [n_kv_heads, g, q_len, num_block]
+    gate_before_masking = gate
+
+    q_block_idx = q_pos_item // moba_chunk_size  # chunk id for each query
+    block_indices = jnp.arange(num_block)  # list every key chunk index
+
+    q_block_idx_b = jnp.expand_dims(q_block_idx, axis=-1)  # [q_len, 1]
+    block_indices_b = jnp.expand_dims(block_indices, axis=0)  # [1, num_block]
+
+    # Block-causal masking: a query can't attend to future key blocks,
+    # and must attend to its own key block.
+    mask_future = q_block_idx_b > block_indices_b
+    gate = jnp.where(mask_future, gate, -float("inf"))
+    mask_diag = q_block_idx_b == block_indices_b
+    gate = jnp.where(mask_diag, float("inf"), gate)
+    gate_after_masking = gate
+
+    k_for_topk = min(moba_topk, num_block)
+    gate_top_k_val, gate_top_k_idx = jax.lax.top_k(gate, k=k_for_topk)  # [n_kv_heads, g, q_len, k_for_topk]
+    gate_top_k_val_min = jnp.min(gate_top_k_val, axis=-1, keepdims=True)  # [n_kv_heads, g, q_len, 1]
+    need_attend_threshold_mask = gate >= gate_top_k_val_min  # [n_kv_heads, g, q_len, num_block]
+
+    # Tie-breaking: if multiple blocks have the same gate value as the k-th
+    # block, we only select the ones that appear in the top-k indices.
+    gate_idx_mask = jnp.sum(
+        jax.nn.one_hot(gate_top_k_idx, num_block, dtype=jnp.bool_), axis=-2
+    )  # [n_kv_heads, g, q_len, num_block]
+    need_attend = jnp.logical_and(need_attend_threshold_mask, gate_idx_mask)  # [n_kv_heads, g, q_len, num_block]
+
+    return (
+        key_gate_weight,
+        gate_before_masking,
+        gate_after_masking,
+        gate_top_k_val,
+        gate_top_k_idx,
+        gate_top_k_val_min,
+        need_attend_threshold_mask,
+        gate_idx_mask,
+        need_attend,  # [n_kv_heads, g, q_len, num_block]
+    )
+
+  def generate_moba_mask_single_item(self, q_item, k_item, q_positions):
+    """Generates the token-level MoBA additive mask for a single batch item."""
+    q_len, _, _ = q_item.shape
+    kv_len, _, _ = k_item.shape
+    moba_chunk_size = self.config.moba_chunk_size
+
+    # Run the gating logic to find which key blocks this query cares about.
+    *_, need_attend = self.calculate_moba_gate_logic(q_item, k_item, q_positions)
+
+    # Expand the block-level `need_attend` mask to a token-level mask.
+    k_block_indices = jnp.arange(kv_len, dtype=jnp.int32) // moba_chunk_size
+    token_level_need_attend = need_attend[..., k_block_indices]
+
+    # Convert the boolean mask to float mask values.
+    gate = jnp.where(token_level_need_attend, 0.0, -float("inf"))
+
+    # Apply a final per-token causal mask to ensure causality within chunks.
+    k_indices = jax.lax.broadcasted_iota(jnp.int32, (q_len, kv_len), 1)
+    q_indices = q_positions[:, None]
+    causal_mask = q_indices >= k_indices
+    gate = jnp.where(causal_mask, gate, -float("inf"))
+
+    # Return the additive mask for this batch item.
+    return gate
+
+  def _generate_moba_mask(self, query: Array, key: Array, q_positions: Array) -> Array:
+    """Builds the token-level MoBA additive mask for the whole batch.
+
+    Args:
+      query: Query tensor shaped `[batch, q_len, n_q_heads, head_dim]`.
+      key: Key tensor shaped `[batch, kv_len, n_kv_heads, head_dim]`.
+      q_positions: Absolute query positions shaped `[q_len]`, shared across the
+        batch, identifying the starting offset of each query token.
+        For example, in prefill after 128 tokens we pass
+        `jnp.arange(128, 128 + q_len)`, while in autoregressive decode with a
+        single new token the vector is `[kv_len - 1]` for each batch element.
+
+    Returns:
+      Additive attention mask with shape
+      `[batch, n_kv_heads, n_q_heads // n_kv_heads, q_len, kv_len]` containing
+      `0.` for permitted positions and `-inf` for masked ones.
+    """
+    # vmap over the batch dimension of query and key. q_positions is constant across the batch.
+    moba_mask = jax.vmap(self.generate_moba_mask_single_item, in_axes=(0, 0, None))(query, key, q_positions)
+    return moba_mask
+
   def apply_attention(
       self,
       query: Array,
@@ -736,7 +877,11 @@ class AttentionOp(nnx.Module):
               """Decode not supported with flash attention.
                               Use `dot_product` instead."""
           )
-        return self.tpu_flash_attention(query, key, value, decoder_segment_ids, self.attn_logits_soft_cap, sinks), None, None
+        return (
+            self.tpu_flash_attention(query, key, value, decoder_segment_ids, self.attn_logits_soft_cap, sinks),
+            None,
+            None,
+        )
       else:
         validate_flash_attention_with_sinks_on_gpu(sinks)
         if model_mode == MODEL_MODE_AUTOREGRESSIVE:
@@ -808,11 +953,11 @@ class AttentionOp(nnx.Module):
     bn = nn.logical_to_mesh_axes((CACHE_BATCH, CACHE_HEADS))
 
     @functools.partial(
-        shard_map,
+        jax.shard_map,
         mesh=self.mesh,
         in_specs=(bnd, bsnd, bsnd, b, None),
         out_specs=(bnd, bn, bn),
-        check_rep=False,
+        check_vma=False,
     )
     def wrap_ragged_attention(
         q: Array, k: Array, v: Array, lengths: Array, block_size: int
@@ -862,7 +1007,7 @@ class AttentionOp(nnx.Module):
     bsnd = nn.logical_to_mesh_axes(self.cache_logical_axis_names)
 
     @functools.partial(
-        shard_map,
+        jax.shard_map,
         mesh=self.mesh,
         in_specs=(
             bsnd,
@@ -872,7 +1017,7 @@ class AttentionOp(nnx.Module):
             None,
         ),
         out_specs=bsnd,
-        check_rep=False,
+        check_vma=False,
     )
     def wrap_ragged_attention(query, key, value, lengths, block_size):
       if query.shape[-2] == key.shape[-2]:
@@ -943,27 +1088,62 @@ class AttentionOp(nnx.Module):
         f" got {query.shape[0]=}/{devices_in_data_fsdp=}"
     )
 
-    # create_splash_attention kernel
-    block_sizes = splash_attention_kernel.BlockSizes(
-        block_q=min(global_block_q, query.shape[2]),
-        block_kv=min(global_block_kv, key.shape[2]),
-        block_kv_compute=min(global_block_kv_compute, key.shape[2]),
-        block_q_dkv=min(global_block_q_dkv, query.shape[2]),
-        block_kv_dkv=min(global_block_kv_dkv, key.shape[2]),
-        block_kv_dkv_compute=min(global_block_kv_dkv_compute, query.shape[2]),
-        block_q_dq=None if global_use_fused_bwd_kernel else min(global_block_q_dq, query.shape[2]),
-        block_kv_dq=None if global_use_fused_bwd_kernel else min(global_block_kv_dq, query.shape[2]),
-        use_fused_bwd_kernel=global_use_fused_bwd_kernel,
-        q_layout=splash_attention_kernel.QKVLayout[global_q_layout],
-        k_layout=splash_attention_kernel.QKVLayout[global_k_layout],
-        v_layout=splash_attention_kernel.QKVLayout[global_v_layout],
-    )
+    # create_splash_attention config
+    def create_sa_config(config, query, key, attn_logits_soft_cap):
+      if config.use_tokamax_splash:
+        sa_config = tokamax_splash_kernel.SplashConfig(
+            block_q=min(global_block_q, query.shape[2]),
+            block_kv=min(global_block_kv, key.shape[2]),
+            block_kv_compute=min(global_block_kv_compute, key.shape[2]),
+            block_q_dkv=min(global_block_q_dkv, query.shape[2]),
+            block_kv_dkv=min(global_block_kv_dkv, key.shape[2]),
+            block_kv_dkv_compute=min(global_block_kv_dkv_compute, query.shape[2]),
+            use_fused_bwd_kernel=True,  # tokamax only supports fused bwd kernel
+            q_layout=tokamax_splash_kernel.QKVLayout[global_q_layout],
+            k_layout=tokamax_splash_kernel.QKVLayout[global_k_layout],
+            v_layout=tokamax_splash_kernel.QKVLayout[global_v_layout],
+            attn_logits_soft_cap=attn_logits_soft_cap,
+            residual_checkpoint_name="context",
+            fwd_cost_estimate=pl.CostEstimate(
+                flops=config.cost_estimate_flops_fwd,
+                transcendentals=0,
+                bytes_accessed=0,
+            )
+            if config.cost_estimate_flops_fwd >= 0
+            else None,
+            bwd_cost_estimate=pl.CostEstimate(
+                flops=config.cost_estimate_flops_bwd,
+                transcendentals=0,
+                bytes_accessed=0,
+            )
+            if config.cost_estimate_flops_bwd >= 0
+            else None,
+            dq_reduction_steps=config.dq_reduction_steps if config.dq_reduction_steps > 0 else None,
+        )
+      else:
+        sa_config = splash_attention_kernel.BlockSizes(
+            block_q=min(global_block_q, query.shape[2]),
+            block_kv=min(global_block_kv, key.shape[2]),
+            block_kv_compute=min(global_block_kv_compute, key.shape[2]),
+            block_q_dkv=min(global_block_q_dkv, query.shape[2]),
+            block_kv_dkv=min(global_block_kv_dkv, key.shape[2]),
+            block_kv_dkv_compute=min(global_block_kv_dkv_compute, query.shape[2]),
+            block_q_dq=None if global_use_fused_bwd_kernel else min(global_block_q_dq, query.shape[2]),
+            block_kv_dq=None if global_use_fused_bwd_kernel else min(global_block_kv_dq, query.shape[2]),
+            use_fused_bwd_kernel=global_use_fused_bwd_kernel,
+            q_layout=splash_attention_kernel.QKVLayout[global_q_layout],
+            k_layout=splash_attention_kernel.QKVLayout[global_k_layout],
+            v_layout=splash_attention_kernel.QKVLayout[global_v_layout],
+        )
+      return sa_config
 
+    sa_config = create_sa_config(self.config, query, key, attn_logits_soft_cap)
     mask_shape = (query.shape[2], key.shape[2])  # (q_seq_len, kv_seq_len)
+    mask_module = tokamax_splash_mask if self.config.use_tokamax_splash else splash_attention_mask
     if self.attention_type == AttentionType.FULL:
-      mask = splash_attention_mask.FullMask(mask_shape)
+      mask = mask_module.FullMask(mask_shape)
     else:
-      mask = splash_attention_mask.CausalMask(shape=mask_shape)
+      mask = mask_module.CausalMask(shape=mask_shape)
 
     # Create LoadBalancedCausalMask if cp and load_balancing
     if cp_size > 1 and load_balanced_context_parallel:
@@ -974,55 +1154,79 @@ class AttentionOp(nnx.Module):
     if self.attention_type == AttentionType.LOCAL_SLIDING:
       if self.sliding_window_size is None:
         raise ValueError("Sliding_window_size must be set if Local Sliding attention type")
-      mask &= splash_attention_mask.LocalMask(
+      mask &= mask_module.LocalMask(
           shape=(query.shape[2], key.shape[2]),
           window_size=(self.sliding_window_size, self.sliding_window_size),
           offset=0,
       )
-      # Apply local masking if local sliding attention is enabled.
-      if self.attention_type == AttentionType.LOCAL_SLIDING:
-        if self.sliding_window_size is None:
-          raise ValueError("Sliding_window_size must be set for Local Sliding attention type")
-        mask &= splash_attention_mask.LocalMask(
-            shape=(query.shape[2], key.shape[2]),
-            window_size=(self.sliding_window_size, self.sliding_window_size),
-            offset=0,
-        )
-      elif self.attention_type == AttentionType.CHUNK:
-        if self.chunk_attn_window_size is None:
-          raise ValueError("chunk_attn_window_size must be set for chunk attention type")
+    elif self.attention_type == AttentionType.CHUNK:
+      if self.chunk_attn_window_size is None:
+        raise ValueError("chunk_attn_window_size must be set for chunk attention type")
 
-        mask &= ChunkedCausalMask(shape=(query.shape[2], key.shape[2]), chunk_size=self.chunk_attn_window_size)
+      mask &= ChunkedCausalMask(shape=(query.shape[2], key.shape[2]), chunk_size=self.chunk_attn_window_size)
 
-    # Create multi-head mask
-    multi_head_mask = splash_attention_mask.MultiHeadMask(masks=(mask,) * query.shape[1])
+    max_logit_value = None
+    if self.config.use_tokamax_splash:
+      # Create mask
+      single_head_mask = mask  # tokamax now just uses a single mask and assumes broadcast to all heads
+      if self.config.use_max_logit_estimate > 0:
+        sa_config = dataclasses.replace(sa_config, max_logit_const=self.config.use_max_logit_estimate)
 
-    # Create the splash attention kernel object separately, jit it for performance
-    @partial(
-        jax.jit,
-        static_argnames=[
-            "multi_head_mask",
-            "shard_head_size",
-        ],
-    )
-    def wrap_splash_kernel(multi_head_mask, shard_head_size=1):
-      splash_kernel = splash_attention_kernel.make_splash_mha(
-          mask=multi_head_mask,
-          head_shards=shard_head_size,  # the size of the axis if sharding over heads
-          q_seq_shards=cp_size,  # axis for sequence sharding
-          block_sizes=block_sizes,
-          attn_logits_soft_cap=attn_logits_soft_cap,
-          residual_checkpoint_name="context",
+      # Create the splash attention kernel object separately, jit it for performance
+      @partial(
+          jax.jit,
+          static_argnames=[
+              "single_head_mask",
+              "shard_head_size",
+          ],
       )
-      return splash_kernel
+      def wrap_splash_kernel(single_head_mask, shard_head_size=1):
+        splash_kernel = tokamax_splash_kernel.make_splash_mha(
+            mask=single_head_mask,
+            config=sa_config,
+            q_seq_shards=cp_size,  # axis for sequence sharding,
+        )
+        return splash_kernel
 
-    logical_axis_rules_head = np.array(
-        [self.mesh.shape[physical_axes] for physical_axes in dict(self.config.logical_axis_rules)[HEAD]]
-    )
-    shard_head_size = np.prod(logical_axis_rules_head)
-    splash_kernel = wrap_splash_kernel(multi_head_mask, int(shard_head_size))
-    named_sharding = jax.sharding.NamedSharding(self.mesh, axis_names_splash_kernel)
-    segment_axis_names_splash_kernel = splash_kernel.manual_sharding_spec(named_sharding)
+      logical_axis_rules_head = np.array(
+          [self.mesh.shape[physical_axes] for physical_axes in dict(self.config.logical_axis_rules)[HEAD]]
+      )
+      shard_head_size = np.prod(logical_axis_rules_head)
+      splash_kernel = wrap_splash_kernel(single_head_mask, int(shard_head_size))
+      if self.config.expert_shard_attention_option == EP_AS_CONTEXT:
+        segment_axis_names_splash_kernel = nn.logical_to_mesh_axes((Q_LENGTH,))
+      else:
+        segment_axis_names_splash_kernel = nn.logical_to_mesh_axes((Q_LENGTH_NO_EXP,))
+    else:
+      # Create multi-head mask
+      multi_head_mask = splash_attention_mask.MultiHeadMask(masks=(mask,) * query.shape[1])
+
+      # Create the splash attention kernel object separately, jit it for performance
+      @partial(
+          jax.jit,
+          static_argnames=[
+              "multi_head_mask",
+              "shard_head_size",
+          ],
+      )
+      def wrap_splash_kernel(multi_head_mask, shard_head_size=1):
+        splash_kernel = splash_attention_kernel.make_splash_mha(
+            mask=multi_head_mask,
+            head_shards=shard_head_size,  # the size of the axis if sharding over heads
+            q_seq_shards=cp_size,  # axis for sequence sharding
+            block_sizes=sa_config,
+            attn_logits_soft_cap=attn_logits_soft_cap,
+            residual_checkpoint_name="context",
+        )
+        return splash_kernel
+
+      logical_axis_rules_head = np.array(
+          [self.mesh.shape[physical_axes] for physical_axes in dict(self.config.logical_axis_rules)[HEAD]]
+      )
+      shard_head_size = np.prod(logical_axis_rules_head)
+      splash_kernel = wrap_splash_kernel(multi_head_mask, int(shard_head_size))
+      named_sharding = jax.sharding.NamedSharding(self.mesh, axis_names_splash_kernel)
+      segment_axis_names_splash_kernel = splash_kernel.manual_sharding_spec(named_sharding)
 
     # Now call the function wrap_flash_attention which does the actual computation.
     # The splash kernel is passed as a parameter to the function. Since we have the shard map
@@ -1033,7 +1237,7 @@ class AttentionOp(nnx.Module):
     #  'segment_axis_names_kv' maps to ['activation_kv_length', []] meaning that K and V are not sharded
     # splash_kernel is sharded over (HEAD, LENGTH)
     @functools.partial(
-        shard_map,
+        jax.shard_map,
         mesh=self.mesh,
         in_specs=(
             axis_names_q,
@@ -1047,7 +1251,7 @@ class AttentionOp(nnx.Module):
             sink_axis_names,  # sharding align with query heads
         ),
         out_specs=axis_names_q,
-        check_rep=False,
+        check_vma=False,
     )
     def wrap_flash_attention(
         query,
@@ -1082,21 +1286,40 @@ class AttentionOp(nnx.Module):
           decoder_segment_ids_tuple = splash_attention_kernel.SegmentIds(decoder_segment_ids_q, decoder_segment_ids_kv)
       else:
         decoder_segment_ids_tuple = None
-      # TODO(ranran): remove if/else branch once b/441336842 is fixed
-      if version.parse(jax.__version__) < version.parse("0.7.2.dev20250824"):
-        attention_output = jax.vmap(splash_kernel)(query, key, value, decoder_segment_ids_tuple)
+
+      if self.config.use_tokamax_splash:
+        if max_logit_value is not None:
+          attention_output = jax.vmap(partial(splash_kernel, max_logit_value=max_logit_value))(
+              query, key, value, decoder_segment_ids_tuple
+          )
+        else:
+          attention_output = jax.vmap(splash_kernel)(query, key, value, decoder_segment_ids_tuple)
       else:
         attention_output = jax.vmap(splash_kernel, in_axes=(0, 0, 0, 0, None))(
             query, key, value, decoder_segment_ids_tuple, sinks
         )
       return attention_output
 
+    def _maybe_shard_with_pspec(inputs, pspec: jax.sharding.PartitionSpec | None):
+      # decoder_segment_ids can be None
+      if pspec is None:
+        return None
+      sharding = NamedSharding(self.mesh, pspec)
+      return maybe_shard_with_name(inputs, sharding, shard_mode=self.config.shard_mode)
+
+    query = _maybe_shard_with_pspec(query, axis_names_q)
+    key = _maybe_shard_with_pspec(key, axis_names_kv)
+    value = _maybe_shard_with_pspec(value, axis_names_kv)
+    decoder_segment_ids_q = _maybe_shard_with_pspec(decoder_segment_ids, segment_axis_names_q)
+    decoder_segment_ids_kv = _maybe_shard_with_pspec(decoder_segment_ids, segment_axis_names_kv)
+    sinks = _maybe_shard_with_pspec(sinks, sink_axis_names)
+
     x = wrap_flash_attention(
         query,
         key,
         value,
-        decoder_segment_ids,
-        decoder_segment_ids,
+        decoder_segment_ids_q,
+        decoder_segment_ids_kv,
         splash_kernel,
         cp_size,
         load_balanced_context_parallel,
@@ -1138,10 +1361,15 @@ class AttentionOp(nnx.Module):
     if self.attention_type == AttentionType.LOCAL_SLIDING or using_context_parallelism:
       mask_type = "causal"  # SWA and Context Parallelism only work with causal masking
       attn_mask = None
+      dummy_attn_mask = None
     else:
       # generate attn_mask
       mask_type = "padding_causal"  # only padding_causal mask type can take a created mask
+      dummy_attn_mask = jnp.zeros((1, 1, 1, self.max_target_length, self.max_target_length), dtype=jnp.uint8)
       attn_mask = self.generate_attention_mask(query, key, decoder_segment_ids, model_mode)
+
+    if attn_mask is not None:
+      attn_mask = jnp.where((attn_mask >= DEFAULT_MASK_VALUE * 0.5), 0, 1).astype(jnp.uint8)
 
     dpa_layer = DotProductAttention(
         head_dim=head_dim,
@@ -1160,6 +1388,17 @@ class AttentionOp(nnx.Module):
         context_parallel_causal_load_balanced=self.config.context_parallel_load_balance,
         context_parallel_axis="context",
     )
+
+    dpa_layer = nnx_wrappers.ToNNX(dpa_layer, rngs=self.rngs)
+    dummy_query_prefill = jnp.zeros(
+        (1, self.max_target_length, self.num_query_heads, self.config.head_dim), dtype=self.dtype
+    )
+    dummy_key_prefill = jnp.zeros((1, self.max_target_length, self.num_kv_heads, self.config.head_dim), dtype=self.dtype)
+    dummy_value_prefill = jnp.zeros(
+        (1, self.max_target_length, self.num_kv_heads, self.config.head_dim), dtype=self.dtype
+    )
+
+    dpa_layer.lazy_init(dummy_query_prefill, dummy_key_prefill, dummy_value_prefill, mask=dummy_attn_mask)
     return dpa_layer(query, key, value, mask=attn_mask)
 
   def cudnn_jax_flash_attention(
@@ -1335,9 +1574,27 @@ class AttentionOp(nnx.Module):
     # Casting softmaxt computation for float32 for model stability.
     if self.float32_logits:
       attn_weights = attn_weights.astype(jnp.float32)
+
     attn_mask = self.generate_attention_mask(
         query, key, decoder_segment_ids, model_mode, previous_chunk, bidirectional_mask
     )
+    if self.config.moba:
+      kv_seq_len = key.shape[1]
+      # This logic for `next_pos` is duplicated from `generate_attention_mask`.
+      # It determines the starting position of the query sequence.
+      next_pos = 0
+      if previous_chunk is not None:
+        next_pos = previous_chunk.shape[1]
+      elif model_mode == MODEL_MODE_AUTOREGRESSIVE and q_seq_len == 1:
+        next_pos = kv_seq_len - 1
+      q_positions = jnp.arange(next_pos, next_pos + q_seq_len)
+
+      # The gate calculation in MoBA uses the unscaled query.
+      # With scaled query, the gate values are scaled, but since the top-k selection
+      # is scale-invariant, we can use the scaled query directly.
+      moba_mask = self._generate_moba_mask(query, key, q_positions)
+      attn_weights += moba_mask
+
     if self.is_partition_in_decode(q_seq_len):
       attn_mask = partitioning.with_sharding_constraint(attn_mask, (KV_LENGTH, HEAD, None, None, None))
     elif model_mode == MODEL_MODE_PREFILL:

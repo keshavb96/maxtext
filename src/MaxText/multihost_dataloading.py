@@ -66,9 +66,17 @@ def _form_global_array(path, array: np.ndarray, global_mesh: Mesh) -> jax.Array:
 
 
 class MultiHostDataLoadIterator:
-  """fold get_next_batch_sharded into a iterator class"""
+  """fold get_next_batch_sharded into a iterator class.
+  expansion_factor_for_grain is only used for grain pipeline when having a subset of hosts loading real data.
+  """
 
-  def __init__(self, dataloader: tf.data.Dataset | Iterable, global_mesh: Mesh, generate_padding_batch: bool = False):
+  def __init__(
+      self,
+      dataloader: tf.data.Dataset | Iterable,
+      global_mesh: Mesh,
+      generate_padding_batch: bool = False,
+      expansion_loading_factor_for_grain: int = -1,
+  ):
     self.global_mesh = global_mesh
     self.dataloader = dataloader
     if isinstance(self.dataloader, tf.data.Dataset):
@@ -80,6 +88,7 @@ class MultiHostDataLoadIterator:
     self.out_of_data = False
     self.last_local_data = None
     self.generate_padding_batch = generate_padding_batch
+    self.expansion_loading_factor_for_grain = expansion_loading_factor_for_grain
 
   def reset(self):
     if isinstance(self.dataloader, tf.data.Dataset):
@@ -107,28 +116,36 @@ class MultiHostDataLoadIterator:
       SLEEP_TIME = 10
       MAX_DATA_LOAD_ATTEMPTS = 30
 
+      local_data = None
       for _ in range(MAX_DATA_LOAD_ATTEMPTS):
         try:
           local_data = next(self.local_iterator)
+          if self.expansion_loading_factor_for_grain > 1:
+            # Since grain checkpoint requires fixed batch_size, we run the dataIterator for
+            # expansion_loading_factor_for_grain times to get the
+            # right batch_size for the host that is loading real data.
+            local_data_list = [local_data]
+            for _ in range(1, self.expansion_loading_factor_for_grain):
+              next_batch = next(self.local_iterator)
+              local_data_list.append(next_batch)
+            local_data = jtu.tree_map(lambda *xs: np.concatenate(xs, axis=0), *local_data_list)
           break  # exit the loop on success
         except tf.errors.FailedPreconditionError as e:
           max_logging.log(f"Failed to get next data batch due to {e}, retrying")
           time.sleep(SLEEP_TIME)
-        except Exception as e:
-          if isinstance(e, StopIteration) or "StopIteration" in str(e):
-            if self.generate_padding_batch:
-              max_logging.log(
-                  f"MultiHostDataLoadIterator: host {jax.process_index()} failed to load data with {type(e)} error: ({e}). It may reach the end of data, generating padding batch as generate_padding_batch=True."
-              )
-              self.out_of_data = True
-              local_data = self._make_padding_batch()
-              break
+        except StopIteration as e:
+          if self.generate_padding_batch:
+            max_logging.log(
+                f"MultiHostDataLoadIterator: host {jax.process_index()} failed to load data with {type(e)} error: ({e}). "
+                "It may have reached the end of the data. Generating a padding batch as generate_padding_batch=True."
+            )
+            self.out_of_data = True
+            local_data = self._make_padding_batch()
+            break
           else:
             raise e
       else:
-        raise TimeoutError(
-            f"Failed to load data after {MAX_DATA_LOAD_ATTEMPTS} retry attempts."
-        )
+        raise TimeoutError(f"Failed to load data after {MAX_DATA_LOAD_ATTEMPTS} retry attempts.")
 
       self.last_local_data = local_data
     input_gdas = jtu.tree_map_with_path(partial(_form_global_array, global_mesh=self.global_mesh), local_data)

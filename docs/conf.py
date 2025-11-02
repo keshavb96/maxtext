@@ -12,17 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration file for the Sphinx documentation builder for MaxText.
 
-# Configuration file for the Sphinx documentation builder.
-#
-# For the full list of built-in configuration values, see the documentation:
-# https://www.sphinx-doc.org/en/master/usage/configuration.html
+This file configures the Sphinx build process for the MaxText project
+documentation. It sets project information, specifies extensions, defines HTML
+output options, and configures MyST parser settings.
+
+For more information on Sphinx configuration, see the official documentation:
+https://www.sphinx-doc.org/en/master/usage/configuration.html
+"""
 
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
 project = "MaxText"
-copyright = "2025, MaxText developers"
+# pylint: disable=redefined-builtin
+copyright = "2025, Google LLC"
 author = "MaxText developers"
 
 # -- General configuration ---------------------------------------------------
@@ -31,6 +36,7 @@ author = "MaxText developers"
 extensions = [
     "myst_nb",
     "sphinx_design",
+    "sphinx_copybutton",
 ]
 
 templates_path = ["_templates"]
@@ -54,7 +60,7 @@ myst_linkify_fuzzy_links = False
 
 # Remove specific documents from ToC
 exclude_patterns = [
-    "guides/run_maxtext_via_multihost_job.md",
-    "guides/run_maxtext_via_multihost_runner.md",
-    "guides/llm_calculator.ipynb",
+    "guides/run_maxtext/run_maxtext_via_multihost_job.md",
+    "guides/run_maxtext/run_maxtext_via_multihost_runner.md",
+    "explanations/llm_calculator.ipynb",
 ]

@@ -17,13 +17,14 @@
 import glob
 from pathlib import Path
 import functools
-
 import ml_collections
+from concurrent import futures
 
 import jax
 
 import grain.python as grain
 
+from MaxText.utils import gcs_utils
 from MaxText.input_pipeline import _input_pipeline_utils
 from MaxText.input_pipeline import _grain_tokenizer
 from MaxText import multihost_dataloading
@@ -32,8 +33,14 @@ from MaxText import tokenizer
 
 
 def find_data_files(data_file_pattern):
-  data_files = glob.glob(str(Path(data_file_pattern).expanduser().resolve()))
-  assert len(data_files) > 0, f"No file found with pattern {data_file_pattern}."
+  """Find data files matching the pattern."""
+  if data_file_pattern.startswith("gs://"):
+    data_files = gcs_utils.gcs_glob_pattern(data_file_pattern)
+  else:
+    # Local files
+    data_files = glob.glob(str(Path(data_file_pattern).expanduser().resolve()))
+  if not data_files:
+    raise FileNotFoundError(f"No files found matching pattern: {data_file_pattern}")
   max_logging.log(f"Found {len(data_files)} files for train/eval with grain")
   return data_files
 
@@ -47,26 +54,58 @@ def get_datasets(
     dataloading_host_index,
     dataloading_host_count,
     grain_worker_count,
+    grain_num_threads,
+    grain_prefetch_buffer_size,
+    grain_data_source_max_workers,
 ):
   """Load dataset from array_record files for using with grain"""
   if data_file_type == "arrayrecord":
+    # Helper function to find files, create data source, and wrap in MapDataset
+    def create_dataset_from_pattern(pattern):
+      files = find_data_files(pattern)
+      source = grain.ArrayRecordDataSource(files)
+      return grain.MapDataset.source(source)
+
     if ";" in data_file_pattern:
-      data_file_patterns, weights = zip(*[pattern.split(":") for pattern in data_file_pattern.split(";")])
+      data_file_patterns, weights = zip(*[pattern.split(",") for pattern in data_file_pattern.split(";")])
       assert len(data_file_patterns) == len(weights), "Number of data file patterns and weights must match"
       weights = [float(weight) for weight in weights]
       weights = [round(weight / sum(weights), 4) for weight in weights]
-      dataset_list = [
-          grain.MapDataset.source(grain.ArrayRecordDataSource(find_data_files(pattern))) for pattern in data_file_patterns
-      ]
-      dataset = grain.MapDataset.mix(dataset_list, weights)
+
+      # Parallelize file finding (globbing), data source creation, and dataset wrapping
+      # File finding and source creation are I/O-bound operations that release the GIL
+      executor = futures.ThreadPoolExecutor(max_workers=grain_data_source_max_workers)
+      dataset_list = list(executor.map(create_dataset_from_pattern, data_file_patterns))
+      executor.shutdown(wait=True)
+
+      # Apply shuffle, repeat, sharding, and conversion to IterDataset to each dataset before mixing
+      for d, _ in enumerate(dataset_list):
+        if shuffle:
+          dataset_list[d] = dataset_list[d].shuffle(seed=shuffle_seed)
+        dataset_list[d] = dataset_list[d].repeat(num_epoch)
+        dataset_list[d] = dataset_list[d][dataloading_host_index::dataloading_host_count]  # sharding
+        dataset_list[d] = dataset_list[d].to_iter_dataset(
+            read_options=grain.ReadOptions(
+                num_threads=grain_num_threads,
+                prefetch_buffer_size=grain_prefetch_buffer_size,
+            )
+        )
+      # Use IterDataset.mix instead of MapDataset.mix in order to have per-mixture component checkpoints
+      # for supporting changing the mixture after checkpointing
+      dataset = grain.IterDataset.mix(dataset_list, weights)
     else:
-      data_files = find_data_files(data_file_pattern)
-      dataset = grain.MapDataset.source(grain.ArrayRecordDataSource(data_files))
-    if shuffle:
-      dataset = dataset.shuffle(seed=shuffle_seed)
-    dataset = dataset.repeat(num_epoch)
-    dataset = dataset[dataloading_host_index::dataloading_host_count]  # sharding
-    dataset = dataset.to_iter_dataset()
+      # Single pattern case - no need for parallelization
+      dataset = create_dataset_from_pattern(data_file_pattern)
+      if shuffle:
+        dataset = dataset.shuffle(seed=shuffle_seed)
+      dataset = dataset.repeat(num_epoch)
+      dataset = dataset[dataloading_host_index::dataloading_host_count]  # sharding
+      dataset = dataset.to_iter_dataset(
+          read_options=grain.ReadOptions(
+              num_threads=grain_num_threads,
+              prefetch_buffer_size=grain_prefetch_buffer_size,
+          )
+      )
   elif data_file_type == "parquet":
     data_files = find_data_files(data_file_pattern)
     dataset = grain.MapDataset.source(data_files)
@@ -88,16 +127,21 @@ def get_datasets(
   return dataset
 
 
-def pretrain_preprocessing_pipeline(dataset, config, data_columns, tokenize, grain_worker_count):
+def pretrain_preprocessing_pipeline(
+    dataset,
+    config,
+    data_columns,
+    tokenize,
+    grain_worker_count,
+    grain_per_worker_buffer_size,
+):
   """Use grain pipeline to pre-process the dataset and return iterators for pretrain"""
   if config.grain_file_type == "arrayrecord":
     dataset = dataset.map(_input_pipeline_utils.ParseFeatures(data_columns, tokenize))
     dataset = dataset.map(_input_pipeline_utils.NormalizeFeatures(data_columns, tokenize))
 
   assert len(data_columns) == 1
-  rekey_dict = {"inputs": "text", "targets": "text"}
-  dataset = dataset.map(_input_pipeline_utils.Rekey(rekey_dict))
-  data_columns = ("inputs", "targets")
+  text_column = data_columns[0]
 
   tokenizer_model = tokenizer.build_tokenizer(
       config.tokenizer_path,
@@ -115,11 +159,15 @@ def pretrain_preprocessing_pipeline(dataset, config, data_columns, tokenize, gra
     pad_id = -1
 
   if tokenize:
-    dataset = dataset.map(
-        _grain_tokenizer.TokenizeAndTrim(
-            data_columns, config.max_target_length, config.add_bos, config.add_eos, tokenizer_model
-        )
-    )
+    if config.use_truncation:
+      dataset = dataset.map(_grain_tokenizer.TokenizeAndTrim(text_column, config.max_target_length, tokenizer_model))
+    else:
+      dataset = dataset.apply(_grain_tokenizer.TokenizeAndChunk(text_column, config.max_target_length, tokenizer_model))
+
+  data_columns = ("inputs", "targets")
+  rekey_dict = {col: text_column for col in data_columns}
+  dataset = dataset.map(_input_pipeline_utils.Rekey(rekey_dict))
+
   # Pack and Batch examples.
   batch_size = config.global_batch_size_to_load // jax.process_count()
   if config.expansion_factor_real_data > 1:
@@ -151,11 +199,23 @@ def pretrain_preprocessing_pipeline(dataset, config, data_columns, tokenize, gra
           axis=1,
       )
   )
-  dataset = dataset.mp_prefetch(grain.MultiprocessingOptions(num_workers=grain_worker_count))
+  dataset = dataset.mp_prefetch(
+      grain.MultiprocessingOptions(
+          num_workers=grain_worker_count,
+          per_worker_buffer_size=grain_per_worker_buffer_size,
+      )
+  )
   return dataset
 
 
-def dpo_preprocessing_pipeline(dataset, config, data_columns, tokenize, grain_worker_count):
+def dpo_preprocessing_pipeline(
+    dataset,
+    config,
+    data_columns,
+    tokenize,
+    grain_worker_count,
+    grain_per_worker_buffer_size,
+):
   """Use grain to pre-process the dataset and return iterators for dpo fine-tuning"""
   if config.grain_file_type == "arrayrecord":
     dataset = dataset.map(_input_pipeline_utils.ParseFeatures(data_columns, tokenize))
@@ -176,17 +236,18 @@ def dpo_preprocessing_pipeline(dataset, config, data_columns, tokenize, grain_wo
     pad_id = -1
 
   if tokenize:
-    dataset = dataset.map(
-        _grain_tokenizer.TokenizeAndTrim(
-            data_columns, config.max_target_length, config.add_bos, config.add_eos, tokenizer_model
-        )
-    )
+    dataset = dataset.map(_grain_tokenizer.TokenizeAndTrim(data_columns, config.max_target_length, tokenizer_model))
 
   dataset = dataset.map(_input_pipeline_utils.PadOrTrimToMaxLength(config.max_target_length, pad_id))
   batch_size = config.global_batch_size_to_load // jax.process_count()
   batch_fn = functools.partial(grain.experimental.batch_and_pad, batch_size=batch_size, pad_value=pad_id)
   dataset = dataset.batch(batch_size, batch_fn=batch_fn)
-  dataset = dataset.mp_prefetch(grain.MultiprocessingOptions(num_workers=grain_worker_count))
+  dataset = dataset.mp_prefetch(
+      grain.MultiprocessingOptions(
+          num_workers=grain_worker_count,
+          per_worker_buffer_size=grain_per_worker_buffer_size,
+      )
+  )
   return dataset
 
 
@@ -209,6 +270,9 @@ def make_grain_train_iterator(
         dataloading_host_index=process_indices.index(jax.process_index()),
         dataloading_host_count=len(process_indices),
         grain_worker_count=config.grain_worker_count,
+        grain_num_threads=config.grain_num_threads,
+        grain_prefetch_buffer_size=config.grain_prefetch_buffer_size,
+        grain_data_source_max_workers=config.grain_data_source_max_workers,
     )
     if config.use_dpo:
       train_dataloader = dpo_preprocessing_pipeline(
@@ -217,6 +281,7 @@ def make_grain_train_iterator(
           data_columns=config.train_data_columns,
           tokenize=config.tokenize_train_data,
           grain_worker_count=config.grain_worker_count,
+          grain_per_worker_buffer_size=config.grain_per_worker_buffer_size,
       )
     else:
       train_dataloader = pretrain_preprocessing_pipeline(
@@ -225,6 +290,7 @@ def make_grain_train_iterator(
           data_columns=config.train_data_columns,
           tokenize=config.tokenize_train_data,
           grain_worker_count=config.grain_worker_count,
+          grain_per_worker_buffer_size=config.grain_per_worker_buffer_size,
       )
     return multihost_dataloading.MultiHostDataLoadIterator(
         train_dataloader,
@@ -241,6 +307,9 @@ def make_grain_train_iterator(
         shuffle_seed=config.data_shuffle_seed,
         num_epoch=config.num_epoch,
         grain_worker_count=config.grain_worker_count,
+        grain_num_threads=config.grain_num_threads,
+        grain_prefetch_buffer_size=config.grain_prefetch_buffer_size,
+        grain_data_source_max_workers=config.grain_data_source_max_workers,
     )
     if config.use_dpo:
       preprocessing_fn = functools.partial(
@@ -249,6 +318,7 @@ def make_grain_train_iterator(
           data_columns=config.train_data_columns,
           tokenize=config.tokenize_train_data,
           grain_worker_count=config.grain_worker_count,
+          grain_per_worker_buffer_size=config.grain_per_worker_buffer_size,
       )
     else:
       preprocessing_fn = functools.partial(
@@ -257,6 +327,7 @@ def make_grain_train_iterator(
           data_columns=config.train_data_columns,
           tokenize=config.tokenize_train_data,
           grain_worker_count=config.grain_worker_count,
+          grain_per_worker_buffer_size=config.grain_per_worker_buffer_size,
       )
     if config.colocated_python_data_input:
       global_shape = (config.global_batch_size_to_load, config.max_target_length)
@@ -296,6 +367,9 @@ def make_grain_eval_iterator(
         dataloading_host_index=process_indices.index(jax.process_index()),
         dataloading_host_count=len(process_indices),
         grain_worker_count=config.grain_worker_count_eval,
+        grain_num_threads=config.grain_num_threads_eval,
+        grain_prefetch_buffer_size=config.grain_prefetch_buffer_size_eval,
+        grain_data_source_max_workers=config.grain_data_source_max_workers,
     )
     if config.use_dpo:
       eval_dataloader = dpo_preprocessing_pipeline(
@@ -304,6 +378,7 @@ def make_grain_eval_iterator(
           data_columns=config.eval_data_columns,
           tokenize=config.tokenize_eval_data,
           grain_worker_count=config.grain_worker_count_eval,
+          grain_per_worker_buffer_size=config.grain_per_worker_buffer_size_eval,
       )
     else:
       eval_dataloader = pretrain_preprocessing_pipeline(
@@ -312,6 +387,7 @@ def make_grain_eval_iterator(
           data_columns=config.eval_data_columns,
           tokenize=config.tokenize_eval_data,
           grain_worker_count=config.grain_worker_count_eval,
+          grain_per_worker_buffer_size=config.grain_per_worker_buffer_size_eval,
       )
     return multihost_dataloading.MultiHostDataLoadIterator(
         eval_dataloader, global_mesh, config.generate_padding_batch_eval
@@ -325,6 +401,9 @@ def make_grain_eval_iterator(
         shuffle_seed=config.data_shuffle_seed,
         num_epoch=1,
         grain_worker_count=config.grain_worker_count_eval,
+        grain_num_threads=config.grain_num_threads_eval,
+        grain_prefetch_buffer_size=config.grain_prefetch_buffer_size_eval,
+        grain_data_source_max_workers=config.grain_data_source_max_workers,
     )
     if config.use_dpo:
       preprocessing_fn = functools.partial(
@@ -333,6 +412,7 @@ def make_grain_eval_iterator(
           data_columns=config.eval_data_columns,
           tokenize=config.tokenize_eval_data,
           grain_worker_count=config.grain_worker_count_eval,
+          grain_per_worker_buffer_size=config.grain_per_worker_buffer_size_eval,
       )
     else:
       preprocessing_fn = functools.partial(
@@ -341,6 +421,7 @@ def make_grain_eval_iterator(
           data_columns=config.eval_data_columns,
           tokenize=config.tokenize_eval_data,
           grain_worker_count=config.grain_worker_count_eval,
+          grain_per_worker_buffer_size=config.grain_per_worker_buffer_size_eval,
       )
     global_shape = (config.global_batch_size_to_load, config.max_target_length)
     return multihost_dataloading.RemoteIterator(get_ds_fn, preprocessing_fn, global_mesh, global_shape)

@@ -18,6 +18,9 @@ run_name: ""
 
 model_name: "default" # override config settings to match a specific model. other than the override, nothing should use this!
 override_model_config: False # When set to true allows overriding model parameters via CLI for the purpose of debugging/testing.
+debug:
+  rl: False # RL-specific debugging
+
 normalization_layer_epsilon: 1.e-05 # epsilon value for rmsnorm, layernorm.
 
 ################################## CHECKPOINTING ##################################
@@ -47,6 +50,7 @@ enable_checkpointing: True
 save_checkpoint_on_completion: True
 async_checkpointing: True
 checkpoint_period: 10_000
+max_num_checkpoints_to_keep: None
 # enables one replica to read the ckpt then broadcast to the rest
 enable_single_replica_ckpt_restoring: False
 
@@ -124,7 +128,9 @@ save_quantized_params_path: ""
 model_call_mode: ""
 use_qwix_quantization: False # Whether to use qwix for quantization. If set to True, the model will be quantized using qwix.
 # Quantization calibration method used for weights and activations. Supported methods can be found in https://github.com/google/qwix/blob/dc2a0770351c740e5ab3cce7c0efe9f7beacce9e/qwix/qconfig.py#L70-L80
-quantization_calibration_method: "absmax"
+weight_quantization_calibration_method: "absmax"
+act_quantization_calibration_method: "absmax"
+bwd_quantization_calibration_method: "absmax"
 # Shard the range finding operation for quantization. By default this is set to number of slices.
 quantization_local_shard_count: -1
 
@@ -149,6 +155,7 @@ logits_dot_in_fp32: False  # whether to use fp32 in logits_dense or shared_embed
 cast_logits_to_fp32: True # whether to cast the logits to fp32. The higher precision is generally beneficial, but it can vary slightly.
 float32_qk_product: False # in dot_product attention, whether to cast to fp32 the inputs to qk product
 float32_logits: False # in dot_product attention, whether to cast to fp32 the inputs to softmax
+float32_weight_sum: True # whether to use full fp32 precision for weight_sum during final unpermute in moe
 
 # Multi-Token Prediction Configs
 # The number of auxiliary prediction layers to use for MTP.
@@ -172,10 +179,26 @@ load_balance_loss_weight: 0.01 # weight for the load balance loss
 use_random_routing: False # whether to use random routing for debug/test purpose
 use_custom_sort_vjp: True # whether to use a custom sort vjp for sparse matmul ops
 use_ring_of_experts: False # whether to use ring of experts for sparse matmul expert parallelism
-# Tunable tiling dimensions used for Megablox
-tile_batch_seq: 512
-tile_embed_dim: 1024
-tile_mlp_dim: 1024
+# Tunable tiling dimensions used for MLP GMM, includes Tokamax ragged_dot and Megablox
+wi_tile_fwd_batch_seq: 512
+wi_tile_fwd_embed_dim: 1024
+wi_tile_fwd_mlp_dim: 1024
+wi_tile_dlhs_batch_seq: 512
+wi_tile_dlhs_embed_dim: 1024
+wi_tile_dlhs_mlp_dim: 1024
+wi_tile_drhs_batch_seq: 512
+wi_tile_drhs_embed_dim: 1024
+wi_tile_drhs_mlp_dim: 1024
+
+wo_tile_fwd_batch_seq: 512
+wo_tile_fwd_embed_dim: 1024
+wo_tile_fwd_mlp_dim: 1024
+wo_tile_dlhs_batch_seq: 512
+wo_tile_dlhs_embed_dim: 1024
+wo_tile_dlhs_mlp_dim: 1024
+wo_tile_drhs_batch_seq: 512
+wo_tile_drhs_embed_dim: 1024
+wo_tile_drhs_mlp_dim: 1024
 norm_topk_prob: False # Boolean to enable the top-k probability normalization. Qwen3-specific normalization of router weights.
 
 # How the expert axis is used to shard attention weights and activations
@@ -470,7 +493,8 @@ ici_expert_parallelism: 1
 # Enable ZeRO-1 optimizer sharding over data axis
 shard_optimizer_over_data: False
 
-# The number of TPU slices is automatically determined, you should not set this explicitly. For ahead of time compilation,
+# Unless explicitly specified, the number of TPU slices is automatically determined. It should only be set for
+# disaggregated reinforcement learning workloads using multiple slices. For ahead of time compilation,
 # you should set compile_toplogy_num_slices, which will in turn set this value. For non-TPU environments this is set to 1.
 num_slices: -1
 
@@ -494,6 +518,11 @@ tokenize_train_data: True  # False if the dataset is pre-tokenized
 tokenize_eval_data: True  # False if the dataset is pre-tokenized
 add_bos: True
 add_eos: True
+# If False, use chunking for long sequences instead of truncation.
+# Note: use_truncation=False is only available in grain's pretrain preprocessing pipeline.
+# See the TokenizeAndTrim and TokenizeAndChunk classes in
+# `src/MaxText/input_pipeline/_grain_tokenizer.py` for implementation details.
+use_truncation: True
 
 # Dataset
 per_device_batch_size: 12.0
@@ -512,6 +541,11 @@ packing: True
 num_epoch: 1  # only grain and tfds pipeline supports num_epoch > 1
 generate_padding_batch_train: False
 generate_padding_batch_eval: False
+# Maximum number of segments that can be packed into a single sequence
+# This needs to be passed to TransformerEngine's DotProductAttention layer for packing
+# NOTE: This parameter is only relevant for GPU packed attention.
+# When using TPU, this parameter will be ignored.
+max_segments_per_seq: 32
 # Rampup batch size, similar to Megatron-LM, see
 # https://github.com/NVIDIA/Megatron-LM/blob/2a01637aa54ccdaf7ea9afc1f1b80f58c53d7f3c/megatron/core/num_microbatches_calculator.py#L233-L237
 # The ramp-up proceeds in stages from `per_device_batch_size_start` up to
@@ -553,15 +587,24 @@ hf_eval_files: ''
 hf_access_token: ''
 # for Grain input pipeline (dataset_type=grain)
 # Path to grain data files. Can be a single pattern or multiple patterns with weights.
-# For multiple patterns, use semicolon (;) to separate and colon (:) to specify weights.
-# Example: "path/to/data1.array_record*:0.3;path/to/data2.array_record*:0.7"
+# For multiple patterns, use semicolon (;) to separate and comma (,) to specify weights.
+# Example: "path/to/data1.array_record*,0.3;path/to/data2.array_record*,0.7"
 # Note: When using multiple files (separated by ';'), only ArrayRecord format is supported.
-# For more details, see https://github.com/google/maxtext/blob/main/getting_started/Data_Input_Pipeline.md#grain-input-pipeline
+# For more details, see https://github.com/AI-Hypercomputer/maxtext/blob/main/docs/guides/data_input_pipeline/data_input_grain.md
 grain_train_files: ''
 grain_eval_files: ''
 grain_file_type: 'arrayrecord' # arrayrecord or parquet
 grain_worker_count: 1
+grain_per_worker_buffer_size: 1
+# num_threads and prefetch_buffer_size are per-worker per-dataset. Used in ReadOptions (https://google-grain.readthedocs.io/en/latest/tutorials/data_loader_tutorial.html#per-worker-readoptions)
+# The default value matches that in the Grain package. If mixing multiple data sources, consider lowering these values to reduce memory usage.
+grain_num_threads: 16  
+grain_prefetch_buffer_size: 500
 grain_worker_count_eval: 1
+grain_per_worker_buffer_size_eval: 1
+grain_num_threads_eval: 16
+grain_prefetch_buffer_size_eval: 500
+grain_data_source_max_workers: 16  # Max workers for ThreadPoolExecutor when mixing multiple Grain data sources.
 # for using pathways
 colocated_python_data_input: False  # experimental feature, under testing
 
@@ -608,6 +651,7 @@ upload_all_profiler_results: False
 skip_first_n_steps_for_profiler: 1
 # Profile for a small number of steps to avoid a large profile file size.
 profiler_steps: 5
+hide_profiler_step_metric: False
 profile_cleanly: True # If set to true, adds a block_until_ready on train state which aligns the profile for each step.
 profile_periodically_period: -1 # If set to a positive integer, profile every profile_periodically_period steps.
 # This is useful to debug scenarios where performance is changing.
@@ -810,6 +854,7 @@ cost_estimate_flops_bwd: -1 # -1 means using splash default cost estmiation, any
 dq_reduction_steps: 0 #the number of reduction steps. For now, only 3 or all the kv steps are supported.
 ### Determine if we want to use load balance for context parallelism
 context_parallel_load_balance: True
+context_parallel_strategy: "all_gather" # "all_gather" or "ring"
 
 ### Paged Attention ###
 # These settings take effect only when `attention=paged`.
@@ -880,6 +925,13 @@ vision_output_dim_for_vit: 4096
 pixel_shuffle_ratio_for_vit: 0.5
 projector_dropout_for_vit: 0.0
 
+# Qwen3-OmniMoe vision encoder
+spatial_merge_size_for_vit: 2
+out_hidden_size_for_vit: 512
+temporal_patch_size_for_vit: 2
+num_position_embeddings_for_vit: 1024
+deepstack_visual_indexes_for_vit: []
+
 # Subslice shape in the form of "x,y,z" when using pathways (single controller). 
 # Example: "8,8" to use a 8x8 subgrid (64 chips) of a full pod (16x16) of trillium.
 subslice_shape: ""
@@ -902,6 +954,8 @@ gdn_num_value_heads: 32
 gdn_chunk_size: 64
 # Whether to apply L2 normalization to query and key tensors inside the Gated Delta Rule kernel.
 use_qk_norm_in_gdn: True
+# The ratio of dimension to apply ROPE on
+partial_rotary_factor: 1.0
 
 # Use tokamax library for gmm kernel implementation
 use_tokamax_gmm: false

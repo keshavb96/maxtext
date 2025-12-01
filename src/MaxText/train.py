@@ -56,7 +56,6 @@ from MaxText import pyconfig
 from MaxText import sharding
 from MaxText.layers.multi_token_prediction import calculate_mtp_acceptance_rate, calculate_mtp_loss
 from MaxText.common_types import ShardMode
-from MaxText.data_loader import create_dataloader
 from MaxText.globals import EPS
 from MaxText.metric_logger import MetricLogger
 from MaxText.utils import gcs_utils
@@ -391,6 +390,8 @@ def train_loop(config, recorder, state=None):
       mesh,
       learning_rate_schedule,
       data_iterator,
+      data_loader,
+      rampup_manager,
       eval_data_iterator,
       state,
   ) = train_utils.setup_train_loop(config, recorder)
@@ -426,7 +427,6 @@ def train_loop(config, recorder, state=None):
 
   start_step = get_first_step(state)  # this is the start_step for training
   prof = profiler.Profiler(config, offset_step=start_step)
-  data_loader = create_dataloader(config, mesh, data_iterator, recorder)
   metric_logger = MetricLogger(config=config, learning_rate_schedule=learning_rate_schedule)
 
   # Write train config params, num model params, and XLA flags to tensorboard
@@ -439,7 +439,7 @@ def train_loop(config, recorder, state=None):
       prof.maybe_activate_profiler(step, state)
 
       with jax.profiler.StepTraceAnnotation("train", step_num=step):
-        example_batch = data_loader.load_next_batch()
+        example_batch = data_loader.load_next_batch(rampup_manager=rampup_manager)
         # Reshard data from loaded sharding to performant activation sharding
         example_batch = sharding.maybe_shard_with_name(
             example_batch,

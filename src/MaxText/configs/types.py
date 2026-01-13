@@ -880,9 +880,9 @@ class DatasetGeneral(BaseModel):
       True,
       description="Whether to pack multiple short examples into a single sequence.",
   )
-  grain_packing_type: Literal["first_fit", "concat_then_split"] = Field(
+  grain_packing_type: Literal["first_fit", "best_fit", "concat_then_split"] = Field(
       "first_fit",
-      description="Packing type when using Grain pipeline. 'first_fit' or 'concat_then_split'.",
+      description="Packing type when using Grain pipeline. 'first_fit', 'best_fit' or 'concat_then_split'.",
   )
   max_segments_per_seq: int = Field(
       -1,
@@ -1345,6 +1345,9 @@ class MultimodalGeneral(BaseModel):
       -1,
       description="Maximum number of images per example for training with image lists. -1 means no limit.",
   )
+  video_path: PathStr = Field("", description="Path to a video for decoding.")
+  audio_path: PathStr = Field("", description="Path to an audio file for decoding.")
+  use_audio_in_video: bool = Field(False, description="Extract and use audio from video files.")
 
 
 class VisionTower(BaseModel):
@@ -1417,14 +1420,14 @@ class VLLM(BaseModel):
   vllm_hf_config_path: str = Field("", description="Path to HuggingFace model config for MaxText model.")
 
 
-class GRPO(BaseModel):
-  """Configuration for Group Relative Policy Optimization (GRPO)."""
+class RL(BaseModel):
+  """Configuration for RL algorithms like Group Relative Policy Optimization (GRPO) among others."""
 
   num_generations: int = Field(2, description="Number of responses to generate per prompt (G in GRPO paper).")
   num_iterations: int = Field(1, description="Number of iterations per batch (μ in GRPO paper).")
   grpo_beta: float = Field(0.08, description="Coefficient for the KL divergence penalty (β).")
   grpo_epsilon: float = Field(0.2, description="Epsilon value for clipping in the GRPO loss.")
-  loss_algo: str = Field("grpo", description="Loss algorithm, e.g., 'grpo' or 'gspo-token'.")
+  loss_algo: Literal["grpo", "gspo-token"] = Field("grpo", description="Loss algorithm, i.e., 'grpo' or 'gspo-token'.")
 
 
 class RLDataset(BaseModel):
@@ -1659,7 +1662,6 @@ class MaxTextConfig(
     # Reinforcement Learning
     RLHardware,
     VLLM,
-    GRPO,
     RLDataset,
     RLEvaluation,
     Reward,
@@ -1709,6 +1711,9 @@ class MaxTextConfig(
   """
 
   debug: Debug = Field(default_factory=Debug, description="Configuration for debugging options.")
+  rl: RL = Field(
+      default_factory=RL, description="Configuration for RL algorithms like Group Relative Policy Optimization (GRPO)."
+  )
   model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
   @model_validator(mode="before")
@@ -2073,6 +2078,7 @@ class MaxTextConfig(
           "gemma3-27b",
           "llama4-17b-16e",
           "llama4-17b-128e",
+          "qwen3-omni-30b-a3b",
       )
       if self.model_name not in valid_mm_models and self.model_name != "default":
         raise ValueError(f"Multimodal is only supported for {valid_mm_models}, not {self.model_name}")
@@ -2154,7 +2160,7 @@ class MaxTextConfig(
       raise ValueError("`eval_steps` must be > 0 when `generate_padding_batch_eval` is True.")
     if self.dataset_type == "hf" and self.num_epoch != 1:
       raise ValueError("HuggingFace pipeline only supports num_epoch=1.")
-    if self.loss_algo == "grpo":
+    if self.rl.loss_algo == "grpo":
       self.use_grpo = True
     else:
       self.use_grpo = False
